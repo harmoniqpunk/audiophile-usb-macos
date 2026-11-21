@@ -158,15 +158,7 @@ static void on_removed(void *refcon, io_iterator_t it)
 
 static CFMutableDictionaryRef usb_matching(void)
 {
-    CFMutableDictionaryRef m = IOServiceMatching("IOUSBHostDevice");
-    SInt32 v = APUSB_VENDOR_ID, p = APUSB_PRODUCT_ID;
-    CFNumberRef nv = CFNumberCreate(NULL, kCFNumberSInt32Type, &v);
-    CFNumberRef np = CFNumberCreate(NULL, kCFNumberSInt32Type, &p);
-    CFDictionarySetValue(m, CFSTR(kUSBVendorID), nv);
-    CFDictionarySetValue(m, CFSTR(kUSBProductID), np);
-    CFRelease(nv);
-    CFRelease(np);
-    return m;
+    return apusb_matching(APUSB_VENDOR_ID, APUSB_PRODUCT_ID);
 }
 
 /* MIDIDriverInterface ------------------------------------------------------ */

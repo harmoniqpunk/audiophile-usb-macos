@@ -80,3 +80,25 @@ Facts as observable in the publicly documented behaviour of the Linux
   entry exists but its Mac link was an unfilled placeholder when checked (Nov 2026).
 
 [kdoc]: https://docs.kernel.org/sound/cards/audiophile-usb.html
+
+## Descriptor findings from a real unit (bcdDevice 1.01, macOS 12.7.6)
+
+- The configuration descriptor is 1106 bytes long and has 7 interfaces:
+  - 0: DFU (class fe/01)
+  - 1: AudioControl
+  - 2: analog out, EP 0x03
+  - 3: digital out, EP 0x04; alt 6 is AC3 (wFormatTag 0x2001)
+  - 4: analog in, EP 0x85
+  - 5: digital in, EP 0x86; alts 1, 2 and 4 only
+  - 6: MIDI, with EP 0x81 interrupt IN (16 bytes), 0x82 bulk IN (16) and 0x02 bulk OUT (16)
+- In **alts 2 and 4** (the S/PDIF-in modes) the OUT endpoints are **asynchronous**. Each has
+  a 3-byte (10.14) feedback endpoint: 0x83 for interface 2, 0x84 for interface 3. All other
+  OUT alts are adaptive. This driver doesn't read the feedback endpoint yet, so the
+  S/PDIF-in modes may drift slowly.
+- Alt 5 (16-bit) has a maximum packet size of 192 bytes, which is exactly 48 stereo frames.
+  The +1-frame drift correction can't fit at 48 kHz, so the stream engine clamps the
+  packet.
+- macOS's AppleUSBAudio (416.2) matches interfaces 1–5 and opens them exclusively, so
+  `USBInterfaceOpenSeize` fails. Interface 6 (MIDI) is left unclaimed.
+- On 12.7, `IOServiceMatching("IOUSBHostDevice")` with plain `idVendor` keys returns
+  nothing. Use `kIOPropertyMatchKey`.

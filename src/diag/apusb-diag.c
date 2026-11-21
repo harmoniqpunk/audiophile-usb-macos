@@ -23,8 +23,12 @@
  * SPDX-License-Identifier: MIT
  */
 #include <CoreAudio/CoreAudio.h>
+#include <CoreMIDI/CoreMIDI.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <mach/mach_time.h>
 #include <math.h>
+#include <stdatomic.h>
+#include <sys/resource.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,7 +52,10 @@ static void usage(void)
         "  tone   [--mode M] [--rate HZ] [--seconds N] [--format F] [--seize]\n"
         "  record [--mode M] [--rate HZ] [--seconds N] [--format F] [--seize] [--out FILE]\n"
         "  midi-monitor [--seconds N] | midi-test\n"
-        "  get-mode | set-mode NAME\n");
+        "  get-mode | set-mode NAME\n"
+        "  hal-list                                   Core Audio devices with latency / safety offsets\n"
+        "  coremidi-list | coremidi-test [--seconds N]   (through the installed CoreMIDI driver)\n"
+        "  hal-test [--uid UID] [--buffer N] [--seconds N] [--level dBFS] [--loopback]\n");
 }
 
 /* ------------------------------------------------------------------------ */
@@ -75,11 +82,7 @@ static int open_device(apusb_device *d, bool quiet)
 
 static int cmd_list(void)
 {
-    CFMutableDictionaryRef m = IOServiceMatching("IOUSBHostDevice");
-    SInt32 v = APUSB_VENDOR_ID;
-    CFNumberRef nv = CFNumberCreate(NULL, kCFNumberSInt32Type, &v);
-    CFDictionarySetValue(m, CFSTR(kUSBVendorID), nv);
-    CFRelease(nv);
+    CFMutableDictionaryRef m = apusb_matching(APUSB_VENDOR_ID, 0);
     io_iterator_t it = 0;
     if (IOServiceGetMatchingServices(kIOMasterPortDefault, m, &it) != kIOReturnSuccess) return 1;
     io_service_t s;
@@ -252,6 +255,11 @@ typedef struct {
     apusb_format format;
     bool         seize;
     const char  *out;
+    unsigned     xfers, framesPerXfer;
+    const char  *uid;
+    unsigned     buffer;
+    double       level;
+    bool         loopback;
 } stream_opts;
 
 typedef struct {
@@ -272,7 +280,7 @@ static void tone_fill(void *c, uint8_t *dst, unsigned frames)
     while (frames) {
         unsigned n = frames > 128 ? 128 : frames;
         for (unsigned i = 0; i < n; i++) {
-            float v = (float)(0.25 * sin(x->phase));
+            float v = (float)(0.1 * sin(x->phase)); /* -20 dBFS */
             x->phase += x->step;
             if (x->phase > 2 * M_PI) x->phase -= 2 * M_PI;
             buf[2 * i] = buf[2 * i + 1] = v;
@@ -366,10 +374,10 @@ static int run_stream(bool capture, const stream_opts *o)
     }
     apusb_stream_callbacks cb = { .packet_frames = tone_frames, .fill = tone_fill,
                                   .consume = rec_consume, .status = status_cb, .ctx = &ctx };
-    s = apusb_stream_create(it, &pipe, capture, 2 * apusb_format_bytes(ctx.fmt), &cb);
+    s = apusb_stream_create(it, &pipe, capture, 2 * apusb_format_bytes(ctx.fmt), o->xfers, o->framesPerXfer, &cb);
     if (!s) { fprintf(stderr, "cannot create stream\n"); goto out; }
     if ((kr = apusb_stream_start(s))) { fprintf(stderr, "start stream: %s\n", apusb_strerror(kr)); goto out; }
-    printf("%s for %.1f s ...\n", capture ? "recording" : "playing 1 kHz tone at -12 dBFS", o->seconds);
+    printf("%s for %.1f s ...\n", capture ? "recording" : "playing 1 kHz tone at -20 dBFS", o->seconds);
     usleep((useconds_t)(o->seconds * 1e6));
     apusb_stream_stop(s);
     uint64_t pk = 0, er = 0, rs = 0;
@@ -507,13 +515,318 @@ static int cmd_set_mode(const char *name)
     return 0;
 }
 
+
+/* ------------------------------------------------------------------------ */
+/* Core Audio level tests (work for this driver and for any other device). */
+
+static UInt32 get_u32(AudioObjectID dev, AudioObjectPropertySelector sel, AudioObjectPropertyScope scope)
+{
+    AudioObjectPropertyAddress a = { sel, scope, kAudioObjectPropertyElementMain };
+    UInt32 v = 0, size = sizeof v;
+    if (AudioObjectGetPropertyData(dev, &a, 0, NULL, &size, &v) != noErr) return 0xffffffffu;
+    return v;
+}
+
+static UInt32 stream_latency(AudioObjectID dev, AudioObjectPropertyScope scope)
+{
+    AudioObjectPropertyAddress a = { kAudioDevicePropertyStreams, scope, kAudioObjectPropertyElementMain };
+    AudioObjectID streams[8];
+    UInt32 size = sizeof streams;
+    if (AudioObjectGetPropertyData(dev, &a, 0, NULL, &size, streams) != noErr || size == 0) return 0;
+    return get_u32(streams[0], kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal);
+}
+
+static void print_device(AudioObjectID dev)
+{
+    AudioObjectPropertyAddress a = { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    CFStringRef name = NULL, uid = NULL;
+    UInt32 size = sizeof name;
+    AudioObjectGetPropertyData(dev, &a, 0, NULL, &size, &name);
+    a.mSelector = kAudioDevicePropertyDeviceUID; size = sizeof uid;
+    AudioObjectGetPropertyData(dev, &a, 0, NULL, &size, &uid);
+    char n[128] = "?", u[256] = "?";
+    if (name) { CFStringGetCString(name, n, sizeof n, kCFStringEncodingUTF8); CFRelease(name); }
+    if (uid) { CFStringGetCString(uid, u, sizeof u, kCFStringEncodingUTF8); CFRelease(uid); }
+    Float64 rate = 0; size = sizeof rate;
+    a.mSelector = kAudioDevicePropertyNominalSampleRate;
+    AudioObjectGetPropertyData(dev, &a, 0, NULL, &size, &rate);
+    AudioValueRange br = { 0, 0 }; size = sizeof br;
+    a.mSelector = kAudioDevicePropertyBufferFrameSizeRange;
+    AudioObjectGetPropertyData(dev, &a, 0, NULL, &size, &br);
+    printf("[%u] \"%s\"  uid=%s  %.0f Hz  buffer %u (range %.0f-%.0f)\n", dev, n, u, rate,
+           get_u32(dev, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal), br.mMinimum, br.mMaximum);
+    for (int sc = 0; sc < 2; sc++) {
+        AudioObjectPropertyScope scope = sc ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput;
+        AudioObjectPropertyAddress sa = { kAudioDevicePropertyStreams, scope, kAudioObjectPropertyElementMain };
+        UInt32 ss = 0;
+        if (AudioObjectGetPropertyDataSize(dev, &sa, 0, NULL, &ss) != noErr || ss == 0) continue;
+        printf("     %s: device latency %u, stream latency %u, safety offset %u frames\n", sc ? "input " : "output",
+               get_u32(dev, kAudioDevicePropertyLatency, scope), stream_latency(dev, scope),
+               get_u32(dev, kAudioDevicePropertySafetyOffset, scope));
+        AudioObjectID streams[8];
+        UInt32 n = sizeof streams;
+        if (AudioObjectGetPropertyData(dev, &sa, 0, NULL, &n, streams) == noErr && n >= sizeof(AudioObjectID)) {
+            AudioObjectPropertyAddress fa = { kAudioStreamPropertyPhysicalFormat, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+            AudioStreamBasicDescription f;
+            UInt32 fs = sizeof f;
+            if (AudioObjectGetPropertyData(streams[0], &fa, 0, NULL, &fs, &f) == noErr)
+                printf("     physical format: %u-bit %s%s, %u ch, %.0f Hz, flags 0x%x\n", f.mBitsPerChannel,
+                       (f.mFormatFlags & kAudioFormatFlagIsFloat) ? "float" : "int",
+                       (f.mFormatFlags & kAudioFormatFlagIsBigEndian) ? " big-endian" : "", f.mChannelsPerFrame, f.mSampleRate, f.mFormatFlags);
+            fa.mSelector = kAudioStreamPropertyAvailablePhysicalFormats;
+            AudioStreamRangedDescription av[32];
+            fs = sizeof av;
+            if (AudioObjectGetPropertyData(streams[0], &fa, 0, NULL, &fs, av) == noErr) {
+                printf("     available:");
+                for (UInt32 k = 0; k < fs / sizeof av[0]; k++)
+                    printf(" %u-bit@%.0f-%.0f", av[k].mFormat.mBitsPerChannel, av[k].mSampleRateRange.mMinimum, av[k].mSampleRateRange.mMaximum);
+                printf("\n");
+            }
+        }
+    }
+}
+
+static int cmd_hal_list(void)
+{
+    AudioObjectPropertyAddress a = { kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &a, 0, NULL, &size) != noErr) return 1;
+    AudioObjectID devs[64];
+    if (size > sizeof devs) size = sizeof devs;
+    AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, &size, devs);
+    for (UInt32 i = 0; i < size / sizeof(AudioObjectID); i++) print_device(devs[i]);
+    return 0;
+}
+
+typedef struct {
+    double      rate, phase, step;
+    float       amp;
+    bool        loopback;
+    _Atomic uint64_t cycles;
+    _Atomic uint32_t overloads;
+    float       inPeak;
+    /* loopback measurement */
+    double      nextPulseAt;     /* output sample time of next pulse */
+    double      lastPulseOut;    /* output sample time of last pulse */
+    bool        waiting;
+    double      rtSum; int rtCount; double rtMin, rtMax;
+    uint64_t    hostNanosSum, hostNanosMax;
+} hal_ctx;
+
+static OSStatus hal_ioproc(AudioObjectID dev, const AudioTimeStamp *now, const AudioBufferList *in, const AudioTimeStamp *inTime,
+                           AudioBufferList *out, const AudioTimeStamp *outTime, void *cd)
+{
+    (void)dev; (void)now;
+    hal_ctx *c = (hal_ctx *)cd;
+    uint64_t t0 = mach_absolute_time();
+    atomic_fetch_add(&c->cycles, 1);
+    if (in && in->mNumberBuffers > 0 && in->mBuffers[0].mData) {
+        const float *x = (const float *)in->mBuffers[0].mData;
+        UInt32 ch = in->mBuffers[0].mNumberChannels ? in->mBuffers[0].mNumberChannels : 1;
+        UInt32 n = in->mBuffers[0].mDataByteSize / (sizeof(float) * ch);
+        for (UInt32 i = 0; i < n; i++) {
+            float v = fabsf(x[i * ch]);
+            if (v > c->inPeak) c->inPeak = v;
+            if (c->loopback && c->waiting && v > 0.05f) {
+                double rt = inTime->mSampleTime + i - c->lastPulseOut;
+                if (rt > 0 && rt < c->rate) {
+                    c->rtSum += rt; c->rtCount++;
+                    if (c->rtCount == 1 || rt < c->rtMin) c->rtMin = rt;
+                    if (rt > c->rtMax) c->rtMax = rt;
+                }
+                c->waiting = false;
+            }
+        }
+    }
+    if (out && out->mNumberBuffers > 0 && out->mBuffers[0].mData) {
+        float *y = (float *)out->mBuffers[0].mData;
+        UInt32 ch = out->mBuffers[0].mNumberChannels ? out->mBuffers[0].mNumberChannels : 1;
+        UInt32 n = out->mBuffers[0].mDataByteSize / (sizeof(float) * ch);
+        for (UInt32 i = 0; i < n; i++) {
+            float v = 0;
+            double t = outTime->mSampleTime + i;
+            if (c->loopback) {
+                if (t >= c->nextPulseAt && t < c->nextPulseAt + 1) {
+                    v = c->amp; c->lastPulseOut = t; c->waiting = true; c->nextPulseAt += c->rate / 2;
+                }
+            } else {
+                v = (float)(c->amp * sin(c->phase));
+                c->phase += c->step;
+                if (c->phase > 2 * M_PI) c->phase -= 2 * M_PI;
+            }
+            for (UInt32 k = 0; k < ch; k++) y[i * ch + k] = v;
+        }
+    }
+    uint64_t dt = mach_absolute_time() - t0;
+    c->hostNanosSum += dt;
+    if (dt > c->hostNanosMax) c->hostNanosMax = dt;
+    return noErr;
+}
+
+static OSStatus overload_listener(AudioObjectID obj, UInt32 n, const AudioObjectPropertyAddress *a, void *cd)
+{
+    (void)obj; (void)n; (void)a;
+    atomic_fetch_add(&((hal_ctx *)cd)->overloads, 1);
+    return noErr;
+}
+
+static AudioObjectID device_by_uid(const char *uidStr)
+{
+    AudioObjectPropertyAddress a = { kAudioHardwarePropertyTranslateUIDToDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    CFStringRef uid = CFStringCreateWithCString(NULL, uidStr, kCFStringEncodingUTF8);
+    AudioObjectID dev = kAudioObjectUnknown;
+    UInt32 size = sizeof dev;
+    AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, sizeof uid, &uid, &size, &dev);
+    CFRelease(uid);
+    return dev;
+}
+
+static int cmd_hal_test(const char *uid, unsigned buffer, double seconds, bool loopback, double level)
+{
+    AudioObjectID dev = device_by_uid(uid ? uid : kDeviceUID);
+    if (dev == kAudioObjectUnknown) { fprintf(stderr, "Core Audio device '%s' not found\n", uid ? uid : kDeviceUID); return 1; }
+    AudioObjectPropertyAddress a = { kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    UInt32 bs = buffer;
+    OSStatus err = AudioObjectSetPropertyData(dev, &a, 0, NULL, sizeof bs, &bs);
+    if (err) fprintf(stderr, "set buffer size %u: %d\n", buffer, (int)err);
+    hal_ctx c = { 0 };
+    a.mSelector = kAudioDevicePropertyNominalSampleRate;
+    UInt32 size = sizeof c.rate;
+    AudioObjectGetPropertyData(dev, &a, 0, NULL, &size, &c.rate);
+    c.step = 2 * M_PI * 1000.0 / c.rate;
+    c.amp = (float)pow(10.0, level / 20.0);
+    c.loopback = loopback;
+    c.nextPulseAt = -1;
+    print_device(dev);
+
+    AudioObjectPropertyAddress ov = { kAudioDeviceProcessorOverload, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    AudioObjectAddPropertyListener(dev, &ov, overload_listener, &c);
+    AudioDeviceIOProcID pid = NULL;
+    if ((err = AudioDeviceCreateIOProcID(dev, hal_ioproc, &c, &pid))) { fprintf(stderr, "CreateIOProcID: %d\n", (int)err); return 1; }
+    struct rusage r0, r1;
+    getrusage(RUSAGE_SELF, &r0);
+    if ((err = AudioDeviceStart(dev, pid))) { fprintf(stderr, "AudioDeviceStart: %d\n", (int)err); AudioDeviceDestroyIOProcID(dev, pid); return 1; }
+    printf("running %s at %.1f dBFS for %.1f s, buffer %u frames...\n", loopback ? "loopback pulses" : "1 kHz tone", level, seconds,
+           get_u32(dev, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal));
+    c.nextPulseAt = 0; /* set below once time is known */
+    AudioTimeStamp ts = { 0 };
+    usleep(200000);
+    if (AudioDeviceGetCurrentTime(dev, &ts) == noErr) c.nextPulseAt = ts.mSampleTime + c.rate / 4;
+    usleep((useconds_t)(seconds * 1e6));
+    AudioDeviceStop(dev, pid);
+    getrusage(RUSAGE_SELF, &r1);
+    AudioDeviceDestroyIOProcID(dev, pid);
+    AudioObjectRemovePropertyListener(dev, &ov, overload_listener, &c);
+
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    uint64_t cyc = atomic_load(&c.cycles);
+    double cpu = (r1.ru_utime.tv_sec - r0.ru_utime.tv_sec) + (r1.ru_utime.tv_usec - r0.ru_utime.tv_usec) / 1e6 +
+                 (r1.ru_stime.tv_sec - r0.ru_stime.tv_sec) + (r1.ru_stime.tv_usec - r0.ru_stime.tv_usec) / 1e6;
+    printf("IO cycles %llu (expected ~%.0f), overloads %u, input peak %.1f dBFS\n", (unsigned long long)cyc,
+           seconds * c.rate / (double)bs, atomic_load(&c.overloads), c.inPeak > 0 ? 20 * log10(c.inPeak) : -200.0);
+    if (cyc) printf("IOProc time avg %.1f us, max %.1f us; client process CPU %.1f%%\n",
+                    (double)c.hostNanosSum * tb.numer / tb.denom / cyc / 1000.0,
+                    (double)c.hostNanosMax * tb.numer / tb.denom / 1000.0, 100.0 * cpu / (seconds + 0.2));
+    if (loopback) {
+        if (c.rtCount)
+            printf("LOOPBACK round trip: avg %.1f frames (%.2f ms), min %.0f, max %.0f over %d pulses\n",
+                   c.rtSum / c.rtCount, 1000.0 * c.rtSum / c.rtCount / c.rate, c.rtMin, c.rtMax, c.rtCount);
+        else
+            printf("LOOPBACK: no pulse detected on input (no cable from output to input?)\n");
+    }
+    return 0;
+}
+
+
+/* ------------------------------------------------------------------------ */
+/* CoreMIDI-level checks: these go through MIDIServer and the installed
+ * AudiophileUSBMIDI.plugin, i.e. exactly what a DAW sees. */
+
+static void midi_name(MIDIObjectRef o, char *buf, size_t n)
+{
+    CFStringRef s = NULL; buf[0] = 0;
+    if (MIDIObjectGetStringProperty(o, kMIDIPropertyDisplayName, &s) == noErr && s) {
+        CFStringGetCString(s, buf, (CFIndex)n, kCFStringEncodingUTF8); CFRelease(s);
+    } else if (MIDIObjectGetStringProperty(o, kMIDIPropertyName, &s) == noErr && s) {
+        CFStringGetCString(s, buf, (CFIndex)n, kCFStringEncodingUTF8); CFRelease(s);
+    }
+}
+
+static int cmd_coremidi_list(void)
+{
+    char name[256], drv[256];
+    ItemCount nd = MIDIGetNumberOfDevices();
+    printf("CoreMIDI devices: %lu\n", (unsigned long)nd);
+    for (ItemCount i = 0; i < nd; i++) {
+        MIDIDeviceRef d = MIDIGetDevice(i);
+        SInt32 offline = 0; MIDIObjectGetIntegerProperty(d, kMIDIPropertyOffline, &offline);
+        CFStringRef ds = NULL; drv[0] = 0;
+        if (MIDIObjectGetStringProperty(d, kMIDIPropertyDriverOwner, &ds) == noErr && ds) {
+            CFStringGetCString(ds, drv, sizeof drv, kCFStringEncodingUTF8); CFRelease(ds);
+        }
+        midi_name(d, name, sizeof name);
+        printf("  device \"%s\" driver=%s %s\n", name, drv[0] ? drv : "-", offline ? "(offline)" : "(online)");
+    }
+    for (ItemCount i = 0; i < MIDIGetNumberOfSources(); i++) { midi_name(MIDIGetSource(i), name, sizeof name); printf("  source \"%s\"\n", name); }
+    for (ItemCount i = 0; i < MIDIGetNumberOfDestinations(); i++) { midi_name(MIDIGetDestination(i), name, sizeof name); printf("  destination \"%s\"\n", name); }
+    return 0;
+}
+
+static _Atomic int gMidiRx;
+static void coremidi_read(const MIDIPacketList *pl, void *r, void *s)
+{
+    (void)r; (void)s;
+    const MIDIPacket *p = &pl->packet[0];
+    for (UInt32 i = 0; i < pl->numPackets; i++) {
+        printf("  rx:"); for (UInt16 k = 0; k < p->length; k++) printf(" %02X", p->data[k]); printf("\n");
+        atomic_fetch_add(&gMidiRx, 1);
+        p = MIDIPacketNext(p);
+    }
+}
+
+static bool is_ours(MIDIEndpointRef e)
+{
+    char name[256]; midi_name(e, name, sizeof name);
+    return strstr(name, "Audiophile") != NULL;
+}
+
+static int cmd_coremidi_test(double seconds)
+{
+    MIDIClientRef cl; MIDIPortRef outp, inp;
+    if (MIDIClientCreate(CFSTR("apusb-diag"), NULL, NULL, &cl)) { fprintf(stderr, "MIDIClientCreate failed\n"); return 1; }
+    MIDIOutputPortCreate(cl, CFSTR("out"), &outp);
+    MIDIInputPortCreate(cl, CFSTR("in"), coremidi_read, NULL, &inp);
+    MIDIEndpointRef dst = 0, src = 0;
+    for (ItemCount i = 0; i < MIDIGetNumberOfDestinations(); i++) if (is_ours(MIDIGetDestination(i))) { dst = MIDIGetDestination(i); break; }
+    for (ItemCount i = 0; i < MIDIGetNumberOfSources(); i++) if (is_ours(MIDIGetSource(i))) { src = MIDIGetSource(i); break; }
+    printf("Audiophile MIDI source: %s, destination: %s\n", src ? "found" : "MISSING", dst ? "found" : "MISSING");
+    if (src) MIDIPortConnectSource(inp, src, NULL);
+    int rc = (src && dst) ? 0 : 1;
+    if (dst) {
+        /* middle C on/off at low velocity, then active sensing; harmless on any synth */
+        Byte buf[256]; MIDIPacketList *pl = (MIDIPacketList *)buf; MIDIPacket *p = MIDIPacketListInit(pl);
+        Byte on[3] = { 0x90, 60, 32 }, off[3] = { 0x80, 60, 0 };
+        p = MIDIPacketListAdd(pl, sizeof buf, p, 0, 3, on);
+        p = MIDIPacketListAdd(pl, sizeof buf, p, 0, 3, off);
+        OSStatus e = MIDISend(outp, dst, pl);
+        printf("MIDISend note on/off -> %s (%d)\n", e ? "FAILED" : "ok", (int)e);
+        if (e) rc = 1;
+    }
+    printf("listening %.0f s for incoming MIDI (MIDI OUT->IN cable would echo the note)...\n", seconds);
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, false);
+    printf("received %d packet(s)\n", atomic_load(&gMidiRx));
+    MIDIClientDispose(cl);
+    return rc;
+}
+
 /* ------------------------------------------------------------------------ */
 
 int main(int argc, char **argv)
 {
     if (argc < 2) { usage(); return 2; }
     const char *cmd = argv[1];
-    stream_opts o = { .mode = apusb_mode_default()->name, .seconds = 5.0 };
+    stream_opts o = { .mode = apusb_mode_default()->name, .seconds = 5.0,
+                      .buffer = 64, .level = -20.0, .xfers = APUSB_STREAM_DEFAULT_XFERS, .framesPerXfer = APUSB_STREAM_DEFAULT_FRAMES_PER_XFER };
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
         const char *v = (i + 1 < argc) ? argv[i + 1] : NULL;
@@ -526,6 +839,12 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(a, "--out") && v) { o.out = v; i++; }
         else if (!strcmp(a, "--seize")) o.seize = true;
+        else if (!strcmp(a, "--uid") && v) { o.uid = v; i++; }
+        else if (!strcmp(a, "--buffer") && v) { o.buffer = (unsigned)atoi(v); i++; }
+        else if (!strcmp(a, "--level") && v) { o.level = atof(v); i++; }
+        else if (!strcmp(a, "--loopback")) o.loopback = true;
+        else if (!strcmp(a, "--xfers") && v) { o.xfers = (unsigned)atoi(v); i++; }
+        else if (!strcmp(a, "--frames-per-xfer") && v) { o.framesPerXfer = (unsigned)atoi(v); i++; }
         else if (!strcmp(cmd, "set-mode") && i == 2) { /* positional */ }
         else { fprintf(stderr, "unknown option %s\n", a); usage(); return 2; }
     }
@@ -538,6 +857,10 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "midi-monitor")) return cmd_midi_monitor(o.seconds);
     if (!strcmp(cmd, "midi-test")) return cmd_midi_test();
     if (!strcmp(cmd, "get-mode")) return cmd_get_mode();
+    if (!strcmp(cmd, "hal-list")) return cmd_hal_list();
+    if (!strcmp(cmd, "coremidi-list")) return cmd_coremidi_list();
+    if (!strcmp(cmd, "coremidi-test")) return cmd_coremidi_test(o.seconds);
+    if (!strcmp(cmd, "hal-test")) return cmd_hal_test(o.uid, o.buffer, o.seconds, o.loopback, o.level);
     if (!strcmp(cmd, "set-mode")) { if (argc < 3) { usage(); return 2; } return cmd_set_mode(argv[2]); }
     usage();
     return 2;

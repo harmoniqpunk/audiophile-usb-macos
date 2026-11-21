@@ -51,8 +51,13 @@ enum {
 
 #define kRingFrames          16384u        /* also the zero-timestamp period */
 #define kChannels            APUSB_CHANNELS
-#define kSafetyOffsetOut     64u
-#define kSafetyOffsetInMs    24u           /* > 2 x transfer length (8 ms) */
+/* Low-latency USB scheduling: kXfers transfers of kFramesPerXfer 1-ms USB frames. */
+#define kXfers               APUSB_STREAM_DEFAULT_XFERS
+#define kFramesPerXfer       APUSB_STREAM_DEFAULT_FRAMES_PER_XFER
+/* Output: the USB thread reads up to one transfer ahead of "now" -> cover it + 1 ms jitter. */
+#define kSafetyOffsetOutMs   (kFramesPerXfer + 1u)
+/* Input: data arrives once per transfer -> cover one transfer + 1 ms jitter. */
+#define kSafetyOffsetInMs    (kFramesPerXfer + 1u)
 #define kCorrectionToleranceMs 2u
 #define kResyncThresholdMs   100u
 
@@ -300,7 +305,7 @@ static OSStatus usb_open_and_start(void)
         cb.fill = play_fill;
         cb.consume = NULL;
         cb.ctx = NULL;
-        gPlayStream = apusb_stream_create(it, &pipe, false, bpf, &cb);
+        gPlayStream = apusb_stream_create(it, &pipe, false, bpf, kXfers, kFramesPerXfer, &cb);
         if (gPlayStream == NULL) goto fail;
         if ((kr = apusb_stream_start(gPlayStream))) goto fail_kr;
     }
@@ -317,7 +322,7 @@ static OSStatus usb_open_and_start(void)
         cb.fill = NULL;
         cb.consume = cap_consume;
         cb.ctx = (void *)1;
-        gCapStream = apusb_stream_create(it, &pipe, true, bpf, &cb);
+        gCapStream = apusb_stream_create(it, &pipe, true, bpf, kXfers, kFramesPerXfer, &cb);
         if (gCapStream == NULL) goto fail;
         if ((kr = apusb_stream_start(gCapStream))) goto fail_kr;
     }
@@ -349,14 +354,54 @@ static void drain(io_iterator_t it)
     while ((s = IOIteratorNext(it)) != 0) IOObjectRelease(s);
 }
 
+/* AppleUSBAudio (built into macOS) claims the AudioStreaming interfaces 1-5
+ * exclusively. When it does, user space cannot stream to the device, so we must
+ * not publish a second, dead "Audiophile USB" device next to Apple's ones. */
+static bool registry_has_apple_audio(io_registry_entry_t e, int depth)
+{
+    if (depth > 4) return false;
+    io_iterator_t it = 0;
+    bool found = false;
+    if (IORegistryEntryGetChildIterator(e, kIOServicePlane, &it) != KERN_SUCCESS) return false;
+    io_registry_entry_t c;
+    while (!found && (c = IOIteratorNext(it)) != 0) {
+        io_name_t cls;
+        if (IOObjectGetClass(c, cls) == KERN_SUCCESS && strncmp(cls, "AppleUSBAudio", 13) == 0) found = true;
+        else found = registry_has_apple_audio(c, depth + 1);
+        IOObjectRelease(c);
+    }
+    IOObjectRelease(it);
+    return found;
+}
+
+static bool device_usable(void)
+{
+    io_service_t s = apusb_find_service(APUSB_VENDOR_ID, APUSB_PRODUCT_ID);
+    if (!s) return false;
+    bool native = registry_has_apple_audio(s, 0);
+    IOObjectRelease(s);
+    if (native) LOG("AudiophileUSB: macOS AppleUSBAudio owns the audio interfaces; "
+                    "not publishing a duplicate device (use Apple's 'Audiophile USB (tm)' devices)");
+    return !native;
+}
+
+static void evaluate_presence(void *ctx)
+{
+    (void)ctx;
+    bool usable = device_usable();
+    if (atomic_exchange(&gDevicePresent, usable) != usable) {
+        LOG("AudiophileUSB: device %s", usable ? "attached" : "not published");
+        device_list_changed();
+    }
+}
+
 static void on_added(void *refcon, io_iterator_t it)
 {
     (void)refcon;
     drain(it);
-    if (!atomic_exchange(&gDevicePresent, true)) {
-        LOG("AudiophileUSB: device attached");
-        device_list_changed();
-    }
+    /* give the kernel a moment to match (or not) AppleUSBAudio first */
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                     dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL, evaluate_presence);
 }
 
 static void on_removed(void *refcon, io_iterator_t it)
@@ -376,15 +421,7 @@ static void on_removed(void *refcon, io_iterator_t it)
 
 static CFMutableDictionaryRef usb_matching(void)
 {
-    CFMutableDictionaryRef m = IOServiceMatching("IOUSBHostDevice");
-    SInt32 v = APUSB_VENDOR_ID, p = APUSB_PRODUCT_ID;
-    CFNumberRef nv = CFNumberCreate(NULL, kCFNumberSInt32Type, &v);
-    CFNumberRef np = CFNumberCreate(NULL, kCFNumberSInt32Type, &p);
-    CFDictionarySetValue(m, CFSTR(kUSBVendorID), nv);
-    CFDictionarySetValue(m, CFSTR(kUSBProductID), np);
-    CFRelease(nv);
-    CFRelease(np);
-    return m;
+    return apusb_matching(APUSB_VENDOR_ID, APUSB_PRODUCT_ID);
 }
 
 static void start_hotplug(void)
@@ -395,9 +432,8 @@ static void start_hotplug(void)
         dispatch_queue_create("com.harmoniqpunk.audiophileusb.hotplug", DISPATCH_QUEUE_SERIAL));
     if (IOServiceAddMatchingNotification(gNotifyPort, kIOFirstMatchNotification, usb_matching(),
                                          on_added, NULL, &gAddedIter) == kIOReturnSuccess) {
-        io_service_t s; bool any = false;
-        while ((s = IOIteratorNext(gAddedIter)) != 0) { any = true; IOObjectRelease(s); }
-        atomic_store(&gDevicePresent, any);
+        drain(gAddedIter);
+        atomic_store(&gDevicePresent, device_usable());
     }
     if (IOServiceAddMatchingNotification(gNotifyPort, kIOTerminatedNotification, usb_matching(),
                                          on_removed, NULL, &gRemovedIter) == kIOReturnSuccess)
@@ -717,11 +753,12 @@ static OSStatus APUSB_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectI
             break;
         case kAudioDevicePropertyLatency:
             NEED(sizeof(UInt32));
-            *(UInt32 *)out = (a->mScope == kAudioObjectPropertyScopeOutput) ? ms_frames(APUSB_STREAM_LATENCY_MS) : ms_frames(APUSB_STREAM_FRAMES_PER_XFER);
+            /* output: data queued in in-flight USB transfers; input: one transfer */
+            *(UInt32 *)out = (a->mScope == kAudioObjectPropertyScopeOutput) ? ms_frames((kXfers - 1) * kFramesPerXfer) : ms_frames(kFramesPerXfer);
             break;
         case kAudioDevicePropertySafetyOffset:
             NEED(sizeof(UInt32));
-            *(UInt32 *)out = (a->mScope == kAudioObjectPropertyScopeInput) ? ms_frames(kSafetyOffsetInMs) : kSafetyOffsetOut;
+            *(UInt32 *)out = (a->mScope == kAudioObjectPropertyScopeInput) ? ms_frames(kSafetyOffsetInMs) : ms_frames(kSafetyOffsetOutMs);
             break;
         case kAudioObjectPropertyOwnedObjects:
         case kAudioDevicePropertyStreams: {

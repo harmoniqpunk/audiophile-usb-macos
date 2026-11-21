@@ -1,9 +1,10 @@
 /*
  * apusb_stream.h - isochronous streaming engine (one direction, one pipe).
  *
- * Runs its own thread with a CFRunLoop that services IOUSBLib completions.
- * Keeps APUSB_STREAM_XFERS transfers of APUSB_STREAM_FRAMES_PER_XFER USB
- * frames (1 ms each at full speed) in flight.
+ * Runs its own real-time (time-constraint) thread with a CFRunLoop that
+ * services IOUSBLib completions. Keeps `xfers` transfers of `framesPerXfer`
+ * USB frames (1 ms each at full speed) in flight. The IO path takes no
+ * locks and performs no allocations.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -18,11 +19,11 @@
 extern "C" {
 #endif
 
-#define APUSB_STREAM_XFERS           6
-#define APUSB_STREAM_FRAMES_PER_XFER 8
-
-/* Total queued playback latency in milliseconds. */
-#define APUSB_STREAM_LATENCY_MS (APUSB_STREAM_XFERS * APUSB_STREAM_FRAMES_PER_XFER)
+#define APUSB_STREAM_MAX_XFERS           16
+#define APUSB_STREAM_MAX_FRAMES_PER_XFER 16
+/* Low-latency defaults: 4 transfers x 2 ms = 8 ms of playback queued. */
+#define APUSB_STREAM_DEFAULT_XFERS           4
+#define APUSB_STREAM_DEFAULT_FRAMES_PER_XFER 2
 
 typedef struct apusb_stream apusb_stream;
 
@@ -39,7 +40,8 @@ typedef struct {
 } apusb_stream_callbacks;
 
 apusb_stream *apusb_stream_create(apusb_interface *intf, const apusb_pipe *pipe, bool isInput,
-                                  unsigned bytesPerFrame, const apusb_stream_callbacks *cb);
+                                  unsigned bytesPerFrame, unsigned xfers, unsigned framesPerXfer,
+                                  const apusb_stream_callbacks *cb);
 IOReturn      apusb_stream_start(apusb_stream *s);
 void          apusb_stream_stop(apusb_stream *s);
 void          apusb_stream_destroy(apusb_stream *s);

@@ -9,31 +9,32 @@
 #include <string.h>
 #include <unistd.h>
 
-static CFMutableDictionaryRef matching_for(const char *className, UInt16 vid, UInt16 pid)
+CFMutableDictionaryRef apusb_matching(UInt16 vendorID, UInt16 productID)
 {
-    CFMutableDictionaryRef m = IOServiceMatching(className);
+    CFMutableDictionaryRef m = IOServiceMatching("IOUSBHostDevice");
     if (m == NULL) return NULL;
-    SInt32 v = vid, p = pid;
+    CFMutableDictionaryRef props = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    SInt32 v = vendorID, p = productID;
     CFNumberRef nv = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &v);
-    CFNumberRef np = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &p);
-    CFDictionarySetValue(m, CFSTR(kUSBVendorID), nv);
-    CFDictionarySetValue(m, CFSTR(kUSBProductID), np);
+    CFDictionarySetValue(props, CFSTR(kUSBVendorID), nv);
     CFRelease(nv);
-    CFRelease(np);
+    if (productID != 0) {
+        CFNumberRef np = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &p);
+        CFDictionarySetValue(props, CFSTR(kUSBProductID), np);
+        CFRelease(np);
+    }
+    CFDictionarySetValue(m, CFSTR(kIOPropertyMatchKey), props);
+    CFRelease(props);
     return m;
 }
 
 io_service_t apusb_find_service(UInt16 vendorID, UInt16 productID)
 {
-    static const char *classes[] = { "IOUSBHostDevice", kIOUSBDeviceClassName };
-    for (size_t c = 0; c < sizeof classes / sizeof classes[0]; c++) {
-        CFMutableDictionaryRef m = matching_for(classes[c], vendorID, productID);
-        if (m == NULL) continue;
-        /* IOServiceGetMatchingService consumes one reference of m. */
-        io_service_t s = IOServiceGetMatchingService(kIOMasterPortDefault, m);
-        if (s) return s;
-    }
-    return 0;
+    CFMutableDictionaryRef m = apusb_matching(vendorID, productID);
+    if (m == NULL) return 0;
+    /* IOServiceGetMatchingService consumes the reference to m. */
+    return IOServiceGetMatchingService(kIOMasterPortDefault, m);
 }
 
 IOReturn apusb_device_create(io_service_t service, apusb_device *out)

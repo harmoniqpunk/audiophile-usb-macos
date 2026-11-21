@@ -40,6 +40,10 @@ typedef struct {
     UInt16 maxPacketSize;
 } apusb_pipe;
 
+/* Matching dictionary for USB devices with vid (and pid unless 0). Uses
+ * IOPropertyMatch: on macOS 12 direct idVendor keys don't match IOUSBHostDevice. */
+CFMutableDictionaryRef apusb_matching(UInt16 vendorID, UInt16 productID);
+
 /* Returns the first service matching vid/pid (caller releases), or 0. */
 io_service_t apusb_find_service(UInt16 vendorID, UInt16 productID);
 

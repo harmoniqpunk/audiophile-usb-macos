@@ -44,7 +44,7 @@ $(MIDI_BUNDLE): src/midi/AudiophileUSBMIDI.c src/midi/Info.plist $(PORTABLE_SRC)
 $(DIAG): src/diag/apusb-diag.c $(PORTABLE_SRC) $(USB_SRC) src/common/*.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/diag/apusb-diag.c $(PORTABLE_SRC) $(USB_SRC) \
-	    $(LDFLAGS) -framework CoreFoundation -framework CoreAudio -framework IOKit
+	    $(LDFLAGS) -framework CoreFoundation -framework CoreAudio -framework CoreMIDI -framework IOKit
 	codesign --force --sign "$(SIGN_ID)" --timestamp=none $@
 
 test:
