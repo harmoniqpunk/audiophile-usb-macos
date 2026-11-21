@@ -44,6 +44,8 @@ typedef struct {
     apusb_midiman_encoder enc;
     IONotificationPortRef notify;
     io_iterator_t         addedIter, removedIter;
+    CFRunLoopTimerRef     retryTimer;
+    unsigned              failures;
 } APMIDIDriver;
 
 static APMIDIDriver *gSelf;
@@ -63,6 +65,7 @@ static void midi_sink(void *ctx, unsigned port, const uint8_t *bytes, unsigned l
 }
 
 static void read_complete(void *refcon, IOReturn result, void *arg0);
+static void usb_close(APMIDIDriver *self);
 
 static IOReturn submit_read(APMIDIDriver *self)
 {
@@ -78,7 +81,14 @@ static void read_complete(void *refcon, IOReturn result, void *arg0)
     UInt32 got = (UInt32)(uintptr_t)arg0;
     if (result == kIOReturnSuccess && got > 0)
         apusb_midiman_decode(self->inBuf, got, midi_sink, self);
-    if (self->stopping || result == kIOReturnAborted || result == kIOReturnNoDevice) return;
+    if (self->stopping) return;
+    if (result == kIOReturnAborted || result == kIOReturnNoDevice || result == kIOReturnNotResponding) {
+        /* interface went away (unplug, or audiophileusbd took the device from
+         * macOS's drivers): close; the retry timer reopens it */
+        os_log(gLog, "AudiophileUSB MIDI: interface lost (%{public}s), will reopen", apusb_strerror(result));
+        usb_close(self);
+        return;
+    }
     if (result == kIOUSBPipeStalled)
         (*self->intf.intf)->ClearPipeStallBothEnds(self->intf.intf, self->inPipe.pipeRef);
     IOReturn kr = submit_read(self);
@@ -97,7 +107,7 @@ static void usb_close(APMIDIDriver *self)
         }
         apusb_interface_close(&self->intf);
     }
-    if (self->usb.dev) apusb_device_release(&self->usb);
+    if (self->usb.service) apusb_device_release(&self->usb);
     self->online = false;
     if (self->device) MIDIObjectSetIntegerProperty(self->device, kMIDIPropertyOffline, 1);
 }
@@ -107,7 +117,7 @@ static bool usb_open(APMIDIDriver *self)
     if (self->online) return true;
     io_service_t svc = apusb_find_service(APUSB_VENDOR_ID, APUSB_PRODUCT_ID);
     if (!svc) return false;
-    IOReturn kr = apusb_device_create(svc, &self->usb);
+    IOReturn kr = apusb_device_attach(svc, &self->usb);
     IOObjectRelease(svc);
     if (kr) return false;
     apusb_device_ensure_configured(&self->usb);
@@ -148,6 +158,17 @@ static void on_added(void *refcon, io_iterator_t it)
     drain(it);
     APMIDIDriver *self = (APMIDIDriver *)refcon;
     if (self->device) usb_open(self);
+}
+
+static void retry_tick(CFRunLoopTimerRef t, void *info)
+{
+    (void)t;
+    APMIDIDriver *self = (APMIDIDriver *)info;
+    if (self->device == 0 || self->online) return;
+    io_service_t svc = apusb_find_service(APUSB_VENDOR_ID, APUSB_PRODUCT_ID);
+    if (!svc) return;
+    IOObjectRelease(svc);
+    usb_open(self);
 }
 
 static void on_removed(void *refcon, io_iterator_t it)
@@ -211,12 +232,18 @@ static OSStatus APM_Start(MIDIDriverRef ref, MIDIDeviceListRef devList)
             drain(self->removedIter);
     }
     if (!usb_open(self)) MIDIObjectSetIntegerProperty(self->device, kMIDIPropertyOffline, 1);
+    /* Re-open after the interface disappears and comes back (device capture
+     * by audiophileusbd, or the native driver releasing it). */
+    CFRunLoopTimerContext tc = { 0, self, NULL, NULL, NULL };
+    self->retryTimer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 2.0, 2.0, 0, 0, retry_tick, &tc);
+    CFRunLoopAddTimer(MIDIGetDriverIORunLoop(), self->retryTimer, kCFRunLoopDefaultMode);
     return noErr;
 }
 
 static OSStatus APM_Stop(MIDIDriverRef ref)
 {
     APMIDIDriver *self = (APMIDIDriver *)ref;
+    if (self->retryTimer) { CFRunLoopTimerInvalidate(self->retryTimer); CFRelease(self->retryTimer); self->retryTimer = NULL; }
     usb_close(self);
     if (self->addedIter) { IOObjectRelease(self->addedIter); self->addedIter = 0; }
     if (self->removedIter) { IOObjectRelease(self->removedIter); self->removedIter = 0; }

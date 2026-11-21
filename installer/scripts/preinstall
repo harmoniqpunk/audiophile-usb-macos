@@ -1,6 +1,8 @@
 #!/bin/bash
 # Remove a previous copy so stale files never mix with the new version.
 set -u
+# Stop the capture daemon (hands the device back to macOS while we update).
+launchctl bootout system/com.harmoniqpunk.audiophileusbd 2>/dev/null || true
 rm -rf "/Library/Audio/Plug-Ins/HAL/AudiophileUSB.driver"
 rm -rf "/Library/Audio/MIDI Drivers/AudiophileUSBMIDI.plugin"
 exit 0

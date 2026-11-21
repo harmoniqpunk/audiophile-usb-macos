@@ -30,11 +30,14 @@ mkdir -p "$STAGE/Library/Audio/Plug-Ins/HAL" \
          "$STAGE/Library/Audio/MIDI Drivers" \
          "$STAGE/Library/Application Support/AudiophileUSB" \
          "$STAGE/usr/local/bin" \
+         "$STAGE/Library/LaunchDaemons" \
          "$DIST"
 
 ditto build/AudiophileUSB.driver "$STAGE/Library/Audio/Plug-Ins/HAL/AudiophileUSB.driver"
 ditto build/AudiophileUSBMIDI.plugin "$STAGE/Library/Audio/MIDI Drivers/AudiophileUSBMIDI.plugin"
 install -m 0755 build/apusb-diag "$STAGE/usr/local/bin/apusb-diag"
+install -m 0755 build/audiophileusbd "$STAGE/Library/Application Support/AudiophileUSB/audiophileusbd"
+install -m 0644 installer/launchd/com.harmoniqpunk.audiophileusbd.plist "$STAGE/Library/LaunchDaemons/com.harmoniqpunk.audiophileusbd.plist"
 install -m 0755 scripts/collect-diagnostics.command "$STAGE/Library/Application Support/AudiophileUSB/collect-diagnostics.command"
 install -m 0755 scripts/uninstall.command "$STAGE/Library/Application Support/AudiophileUSB/uninstall.command"
 install -m 0644 README.md LICENSE "$STAGE/Library/Application Support/AudiophileUSB/"

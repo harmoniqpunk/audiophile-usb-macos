@@ -48,6 +48,9 @@ CFMutableDictionaryRef apusb_matching(UInt16 vendorID, UInt16 productID);
 io_service_t apusb_find_service(UInt16 vendorID, UInt16 productID);
 
 IOReturn apusb_device_create(io_service_t service, apusb_device *out);
+/* Like create, but without a device user client (dev stays NULL): enough to
+ * open interfaces, and works while the capture daemon owns the device. */
+IOReturn apusb_device_attach(io_service_t service, apusb_device *out);
 void     apusb_device_release(apusb_device *d);
 /* Selects configuration 1 if the device is still unconfigured. */
 IOReturn apusb_device_ensure_configured(apusb_device *d);
@@ -62,6 +65,11 @@ IOReturn apusb_interface_find_pipe(apusb_interface *i, UInt8 direction, UInt8 tr
 /* USB Audio 1.0 SET_CUR SAMPLING_FREQ_CONTROL to an endpoint. */
 IOReturn apusb_set_sample_rate(apusb_interface *i, UInt8 endpointAddress, UInt32 rate);
 IOReturn apusb_get_sample_rate(apusb_interface *i, UInt8 endpointAddress, UInt32 *rate);
+
+/* Root only (or com.apple.vm.device-access): detach every kernel driver
+ * (AppleUSBAudio) from the device and keep it for this process; release=false
+ * hands it back to macOS. Capture also ends when the process exits. */
+IOReturn apusb_device_capture(apusb_device *d, bool capture);
 
 const char *apusb_strerror(IOReturn r);
 

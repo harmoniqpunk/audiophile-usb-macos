@@ -126,8 +126,14 @@ static void completion(void *refcon, IOReturn result, void *arg0)
         }
     }
     atomic_fetch_add(&s->packets, s->framesPerXfer);
-    if (atomic_load(&s->stopping) || result == kIOReturnAborted || result == kIOReturnNoDevice) return;
-    submit(s, x);
+    if (atomic_load(&s->stopping) || result == kIOReturnNoDevice) return;
+    if (result == kIOReturnAborted) report(s, result, "isoch transfer aborted (not by us) - resubmitting");
+    /* never let a transfer die: if the schedule fell behind, resync to the bus */
+    if (submit(s, x) != kIOReturnSuccess && !atomic_load(&s->stopping)) {
+        atomic_fetch_add(&s->resyncs, 1);
+        resync_frame(s);
+        submit(s, x);
+    }
 }
 
 static void make_realtime(unsigned periodMs)

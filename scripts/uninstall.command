@@ -9,6 +9,10 @@ if [[ $EUID -ne 0 ]]; then
     exec sudo /bin/bash "$0" "$@"
 fi
 
+echo "Stopping audiophileusbd (gives the device back to macOS)..."
+launchctl bootout system/com.harmoniqpunk.audiophileusbd 2>/dev/null || true
+rm -f /Library/LaunchDaemons/com.harmoniqpunk.audiophileusbd.plist /Library/Logs/audiophileusbd.log
+
 echo "Removing files..."
 rm -rf "/Library/Audio/Plug-Ins/HAL/AudiophileUSB.driver"
 rm -rf "/Library/Audio/MIDI Drivers/AudiophileUSBMIDI.plugin"

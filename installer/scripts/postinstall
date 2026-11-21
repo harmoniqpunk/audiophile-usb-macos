@@ -14,6 +14,15 @@ for p in "$HAL" "$MIDI" "$SUPPORT"; do
 done
 [[ -f /usr/local/bin/apusb-diag ]] && chown root:wheel /usr/local/bin/apusb-diag && chmod 0755 /usr/local/bin/apusb-diag
 
+# Start the capture daemon: it detaches macOS's generic AppleUSBAudio driver
+# from the Audiophile USB so this driver can use it (stops on uninstall).
+PLIST=/Library/LaunchDaemons/com.harmoniqpunk.audiophileusbd.plist
+if [[ -f "$PLIST" ]]; then
+    chown root:wheel "$PLIST"; chmod 0644 "$PLIST"
+    launchctl bootout system/com.harmoniqpunk.audiophileusbd 2>/dev/null || true
+    launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl load -w "$PLIST" 2>/dev/null || true
+fi
+
 # Reload Core Audio so the new HAL plug-in is picked up (audio stops briefly).
 launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null || killall coreaudiod 2>/dev/null || true
 # CoreMIDI's server restarts on demand and rescans MIDI drivers.

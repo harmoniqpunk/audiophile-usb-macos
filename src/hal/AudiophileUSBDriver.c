@@ -22,6 +22,8 @@
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
+#include <math.h>
+#include <notify.h>
 #include <os/log.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -32,6 +34,7 @@
 #include "apusb_ring.h"
 #include "apusb_stream.h"
 #include "apusb_usb.h"
+#include "apusb_reset.h"
 
 /* ------------------------------------------------------------------------ */
 #pragma mark Constants
@@ -44,8 +47,8 @@ enum {
 };
 
 #define kPlugIn_BundleID     "com.harmoniqpunk.audiophileusb.driver"
-#define kDevice_Name         "Audiophile USB (experimental)"
-#define kDevice_Manufacturer "M-Audio (community driver)"
+#define kDevice_Name         "Audiophile USB"
+#define kDevice_Manufacturer "M-Audio"
 #define kDevice_UID          "AudiophileUSB_0763_2003"
 #define kDevice_ModelUID     "AudiophileUSB_Model"
 
@@ -101,6 +104,7 @@ static apusb_pacer     gPacer;
 static int64_t         gOutReadPos = 0, gInWritePos = 0;
 static bool            gInSynced = false;
 static float           gLastInFrame[kChannels];
+static float           gInPeak = 0;
 static float           gScratchOut[256 * kChannels];
 static float           gScratchIn[256 * kChannels];
 
@@ -185,6 +189,43 @@ static void fill_asbd(AudioStreamBasicDescription *d, Float64 rate)
     d->mBitsPerChannel = 32;
 }
 
+/* Formats offered in Audio MIDI Setup. Each maps onto one device mode:
+ * 16-bit -> 16bit-48k, 24-bit <= 48 kHz -> 24bit-48k, 24-bit 88.2/96 kHz ->
+ * the half-duplex 96k mode of that direction. */
+static const Float64 kAllRates[] = { 44100.0, 48000.0, 88200.0, 96000.0 };
+#define kNumAllRates 4u
+static const struct { UInt32 bits; Float64 rate; } kPhysFormats[] = {
+    { 16, 44100.0 }, { 16, 48000.0 }, { 24, 44100.0 }, { 24, 48000.0 }, { 24, 88200.0 }, { 24, 96000.0 },
+};
+#define kNumPhysFormats 6u
+
+static UInt32 mode_bits(const apusb_mode *m) { return 8u * apusb_format_bytes(m->format); }
+
+static void fill_phys(AudioStreamBasicDescription *d, Float64 rate, UInt32 bits, bool bigEndian)
+{
+    memset(d, 0, sizeof *d);
+    d->mSampleRate = rate;
+    d->mFormatID = kAudioFormatLinearPCM;
+    d->mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked | (bigEndian ? kAudioFormatFlagIsBigEndian : 0);
+    d->mBytesPerFrame = d->mBytesPerPacket = (bits / 8) * kChannels;
+    d->mFramesPerPacket = 1;
+    d->mChannelsPerFrame = kChannels;
+    d->mBitsPerChannel = bits;
+}
+
+/* dir: 0 = output stream, 1 = input stream, -1 = device-wide request. bits 0 = keep depth. */
+static const apusb_mode *mode_for(UInt32 bits, Float64 rate, int dir)
+{
+    if (rate > 48000.0) {
+        if (bits == 16) return NULL;
+        if (gMode && mode_bits(gMode) == 24 && apusb_mode_supports_rate(gMode, rate) && dir == -1) return gMode;
+        return apusb_mode_by_name(dir == 1 ? "24bit-96k-record" : "24bit-96k-play");
+    }
+    if (gMode && (bits == 0 || mode_bits(gMode) == bits) && apusb_mode_supports_rate(gMode, rate)) return gMode;
+    if (bits == 0) bits = (gMode && gMode->defaultRate <= 48000.0) ? mode_bits(gMode) : 24;
+    return apusb_mode_by_name(bits == 16 ? "16bit-48k" : "24bit-48k");
+}
+
 /* ------------------------------------------------------------------------ */
 #pragma mark USB streaming callbacks
 
@@ -235,6 +276,7 @@ static void cap_consume(void *ctx, const uint8_t *src, unsigned frames)
     while (frames > 0) {
         unsigned n = frames > 256 ? 256 : frames;
         apusb_pcm_to_float(src, gScratchIn, n, kChannels, gMode->format);
+        for (unsigned k = 0; k < n * kChannels; k++) { float v = fabsf(gScratchIn[k]); if (v > gInPeak) gInPeak = v; }
         apusb_ring_write(&gInRing, gInWritePos, gScratchIn, n);
         memcpy(gLastInFrame, gScratchIn + (size_t)(n - 1) * kChannels, sizeof gLastInFrame);
         gInWritePos += n;
@@ -252,24 +294,69 @@ static void stream_status(void *ctx, IOReturn r, const char *what)
 /* ------------------------------------------------------------------------ */
 #pragma mark USB open / close
 
+static void log_stream_stats(apusb_stream *st, const char *what)
+{
+    uint64_t pk = 0, er = 0, rs = 0;
+    apusb_stream_stats(st, &pk, &er, &rs);
+    LOG("AudiophileUSB: %{public}s stopped: %llu USB packets, %llu errors, %llu resyncs", what,
+        (unsigned long long)pk, (unsigned long long)er, (unsigned long long)rs);
+}
+
+/* The Audiophile USB keeps internal state from the last configuration it
+ * streamed in; switching bit depth / rate without a USB re-enumeration gives
+ * garbage samples (measured: silent input at -5 dBFS RMS). So whenever the
+ * configuration differs from the one used since the last reset, ask
+ * audiophileusbd (root) to re-enumerate the device first (~1-2 s). */
+static _Atomic bool gResetting = false;
+static double gLastConfigKey = -1;
+
+static bool request_device_reset(void)
+{
+    int tok = -1;
+    uint64_t before = 0, now = 0;
+    if (notify_register_check(APUSB_NOTIFY_RESET_DONE, &tok) != NOTIFY_STATUS_OK) {
+        LOGE("AudiophileUSB: notify unavailable, cannot reset device");
+        return false;
+    }
+    notify_get_state(tok, &before);
+    atomic_store(&gResetting, true);
+    notify_post(APUSB_NOTIFY_RESET_REQUEST);
+    bool ok = false;
+    for (int i = 0; i < 100 && !ok; i++) {          /* <= 5 s */
+        usleep(50 * 1000);
+        notify_get_state(tok, &now);
+        ok = now != before;
+    }
+    notify_cancel(tok);
+    LOG("AudiophileUSB: device reset %{public}s", ok ? "done" : "timed out (is audiophileusbd running?)");
+    return ok;
+}
+
 static void usb_close(void)
 {
-    if (gPlayStream) { apusb_stream_destroy(gPlayStream); gPlayStream = NULL; }
-    if (gCapStream)  { apusb_stream_destroy(gCapStream);  gCapStream = NULL; }
+    if (gPlayStream) { apusb_stream_stop(gPlayStream); log_stream_stats(gPlayStream, "playback"); apusb_stream_destroy(gPlayStream); gPlayStream = NULL; }
+    if (gCapStream)  { apusb_stream_stop(gCapStream); log_stream_stats(gCapStream, "capture");
+                       LOG("AudiophileUSB: capture peak %d dBFS (x10)", gInPeak > 0 ? (int)(200.0 * log10(gInPeak)) : -2000);
+                       gInPeak = 0; apusb_stream_destroy(gCapStream);  gCapStream = NULL; }
     for (int i = APUSB_IF_STREAM_FIRST; i <= APUSB_IF_STREAM_LAST; i++) {
         if (gIntf[i].intf) {
             apusb_interface_set_alt(&gIntf[i], 0);
             apusb_interface_close(&gIntf[i]);
         }
     }
-    if (gUSB.dev) apusb_device_release(&gUSB);
+    if (gUSB.service) apusb_device_release(&gUSB);
 }
 
 static OSStatus usb_open_and_start(void)
 {
+    double key = (double)(gMode - apusb_mode_at(0)) * 1.0e6 + gSampleRate;
+    if (key != gLastConfigKey) {
+        if (request_device_reset()) gLastConfigKey = key;
+    }
     io_service_t svc = apusb_find_service(APUSB_VENDOR_ID, APUSB_PRODUCT_ID);
+    atomic_store(&gResetting, false);
     if (!svc) { LOGE("AudiophileUSB: device not found"); return kAudioHardwareBadDeviceError; }
-    IOReturn kr = apusb_device_create(svc, &gUSB);
+    IOReturn kr = apusb_device_attach(svc, &gUSB);
     IOObjectRelease(svc);
     if (kr) { LOGE("AudiophileUSB: device_create %{public}s", apusb_strerror(kr)); return kAudioHardwareUnspecifiedError; }
 
@@ -380,27 +467,35 @@ static bool device_usable(void)
     if (!s) return false;
     bool native = registry_has_apple_audio(s, 0);
     IOObjectRelease(s);
-    if (native) LOG("AudiophileUSB: macOS AppleUSBAudio owns the audio interfaces; "
-                    "not publishing a duplicate device (use Apple's 'Audiophile USB (tm)' devices)");
     return !native;
 }
 
 static void evaluate_presence(void *ctx)
 {
     (void)ctx;
+    if (atomic_load(&gResetting)) return;
     bool usable = device_usable();
     if (atomic_exchange(&gDevicePresent, usable) != usable) {
-        LOG("AudiophileUSB: device %s", usable ? "attached" : "not published");
+        LOG("AudiophileUSB: device %{public}s", usable ? "available (interfaces free)" :
+            "not available (absent, or macOS AppleUSBAudio owns it - is audiophileusbd running?)");
+        if (!usable) {
+            AudioObjectPropertyAddress alive = { kAudioDevicePropertyDeviceIsAlive,
+                kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+            notify_properties(kObjectID_Device, 1, &alive);
+        }
         device_list_changed();
     }
 }
+
+static dispatch_source_t gPresenceTimer;
+static void presence_tick(void *ctx) { (void)ctx; if (gIORunning == 0) evaluate_presence(NULL); }
 
 static void on_added(void *refcon, io_iterator_t it)
 {
     (void)refcon;
     drain(it);
     /* give the kernel a moment to match (or not) AppleUSBAudio first */
-    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                      dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL, evaluate_presence);
 }
 
@@ -408,15 +503,7 @@ static void on_removed(void *refcon, io_iterator_t it)
 {
     (void)refcon;
     drain(it);
-    io_service_t still = apusb_find_service(APUSB_VENDOR_ID, APUSB_PRODUCT_ID);
-    if (still) { IOObjectRelease(still); return; }
-    if (atomic_exchange(&gDevicePresent, false)) {
-        LOG("AudiophileUSB: device detached");
-        AudioObjectPropertyAddress alive = { kAudioDevicePropertyDeviceIsAlive,
-            kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-        notify_properties(kObjectID_Device, 1, &alive);
-        device_list_changed();
-    }
+    evaluate_presence(NULL);
 }
 
 static CFMutableDictionaryRef usb_matching(void)
@@ -434,10 +521,18 @@ static void start_hotplug(void)
                                          on_added, NULL, &gAddedIter) == kIOReturnSuccess) {
         drain(gAddedIter);
         atomic_store(&gDevicePresent, device_usable());
+        LOG("AudiophileUSB: device %{public}s at start", atomic_load(&gDevicePresent) ? "available" : "not available");
     }
     if (IOServiceAddMatchingNotification(gNotifyPort, kIOTerminatedNotification, usb_matching(),
                                          on_removed, NULL, &gRemovedIter) == kIOReturnSuccess)
         drain(gRemovedIter);
+    /* audiophileusbd detaches AppleUSBAudio without a new plug event: re-check
+     * ownership every 2 s while IO is not running (cheap registry walk). */
+    gPresenceTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    dispatch_source_set_timer(gPresenceTimer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 2 * NSEC_PER_SEC, NSEC_PER_SEC / 2);
+    dispatch_source_set_event_handler_f(gPresenceTimer, presence_tick);
+    dispatch_resume(gPresenceTimer);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -553,7 +648,9 @@ static OSStatus APUSB_PerformDeviceConfigurationChange(AudioServerPlugInDriverRe
         gSampleRate = gPendingRate;
     } else if (action == kChange_Mode && gPendingMode) {
         gMode = gPendingMode;
-        if (!apusb_mode_supports_rate(gMode, gSampleRate)) gSampleRate = gMode->defaultRate;
+        if (gPendingRate > 0 && apusb_mode_supports_rate(gMode, gPendingRate)) gSampleRate = gPendingRate;
+        else if (!apusb_mode_supports_rate(gMode, gSampleRate)) gSampleRate = gMode->defaultRate;
+        LOG("AudiophileUSB: mode %{public}s, %d Hz", gMode->name, (int)gSampleRate);
     }
     gPendingRate = 0;
     gPendingMode = NULL;
@@ -681,13 +778,15 @@ static OSStatus APUSB_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObj
     case kAudioDevicePropertyNominalSampleRate:
         *out = sizeof(Float64); return 0;
     case kAudioDevicePropertyAvailableNominalSampleRates:
-        *out = gMode->numRates * sizeof(AudioValueRange); return 0;
+        *out = kNumAllRates * sizeof(AudioValueRange); return 0;
     case kAudioDevicePropertyPreferredChannelsForStereo:
         *out = 2 * sizeof(UInt32); return 0;
     case kAudioStreamPropertyVirtualFormat: case kAudioStreamPropertyPhysicalFormat:
         *out = sizeof(AudioStreamBasicDescription); return 0;
-    case kAudioStreamPropertyAvailableVirtualFormats: case kAudioStreamPropertyAvailablePhysicalFormats:
-        *out = gMode->numRates * sizeof(AudioStreamRangedDescription); return 0;
+    case kAudioStreamPropertyAvailableVirtualFormats:
+        *out = kNumAllRates * sizeof(AudioStreamRangedDescription); return 0;
+    case kAudioStreamPropertyAvailablePhysicalFormats:
+        *out = kNumPhysFormats * sizeof(AudioStreamRangedDescription); return 0;
     default:
         *out = sizeof(UInt32); return 0;
     }
@@ -773,11 +872,11 @@ static OSStatus APUSB_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectI
         case kAudioObjectPropertyControlList: *outDataSize = 0; break;
         case kAudioDevicePropertyNominalSampleRate: NEED(sizeof(Float64)); *(Float64 *)out = gSampleRate; break;
         case kAudioDevicePropertyAvailableNominalSampleRates: {
-            UInt32 n = gMode->numRates;
+            UInt32 n = kNumAllRates;
             if (inDataSize < n * sizeof(AudioValueRange)) n = inDataSize / sizeof(AudioValueRange);
             for (UInt32 i = 0; i < n; i++) {
-                ((AudioValueRange *)out)[i].mMinimum = gMode->rates[i];
-                ((AudioValueRange *)out)[i].mMaximum = gMode->rates[i];
+                ((AudioValueRange *)out)[i].mMinimum = kAllRates[i];
+                ((AudioValueRange *)out)[i].mMaximum = kAllRates[i];
             }
             *outDataSize = n * sizeof(AudioValueRange);
             break;
@@ -829,19 +928,32 @@ static OSStatus APUSB_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectI
         case kAudioStreamPropertyStartingChannel: NEED(sizeof(UInt32)); *(UInt32 *)out = 1; break;
         case kAudioStreamPropertyLatency: NEED(sizeof(UInt32)); *(UInt32 *)out = 0; break;
         case kAudioStreamPropertyVirtualFormat:
-        case kAudioStreamPropertyPhysicalFormat:
             NEED(sizeof(AudioStreamBasicDescription));
             fill_asbd((AudioStreamBasicDescription *)out, gSampleRate);
             break;
-        case kAudioStreamPropertyAvailableVirtualFormats:
-        case kAudioStreamPropertyAvailablePhysicalFormats: {
-            UInt32 n = gMode->numRates;
+        case kAudioStreamPropertyPhysicalFormat:
+            NEED(sizeof(AudioStreamBasicDescription));
+            fill_phys((AudioStreamBasicDescription *)out, gSampleRate, mode_bits(gMode),
+                      gMode->format == APUSB_FMT_S24_3BE || gMode->format == APUSB_FMT_S16BE);
+            break;
+        case kAudioStreamPropertyAvailableVirtualFormats: {
+            UInt32 n = kNumAllRates;
             if (inDataSize < n * sizeof(AudioStreamRangedDescription)) n = inDataSize / sizeof(AudioStreamRangedDescription);
             for (UInt32 i = 0; i < n; i++) {
                 AudioStreamRangedDescription *r = &((AudioStreamRangedDescription *)out)[i];
-                fill_asbd(&r->mFormat, gMode->rates[i]);
-                r->mSampleRateRange.mMinimum = gMode->rates[i];
-                r->mSampleRateRange.mMaximum = gMode->rates[i];
+                fill_asbd(&r->mFormat, kAllRates[i]);
+                r->mSampleRateRange.mMinimum = r->mSampleRateRange.mMaximum = kAllRates[i];
+            }
+            *outDataSize = n * sizeof(AudioStreamRangedDescription);
+            break;
+        }
+        case kAudioStreamPropertyAvailablePhysicalFormats: {
+            UInt32 n = kNumPhysFormats;
+            if (inDataSize < n * sizeof(AudioStreamRangedDescription)) n = inDataSize / sizeof(AudioStreamRangedDescription);
+            for (UInt32 i = 0; i < n; i++) {
+                AudioStreamRangedDescription *r = &((AudioStreamRangedDescription *)out)[i];
+                fill_phys(&r->mFormat, kPhysFormats[i].rate, kPhysFormats[i].bits, kPhysFormats[i].bits == 24);
+                r->mSampleRateRange.mMinimum = r->mSampleRateRange.mMaximum = kPhysFormats[i].rate;
             }
             *outDataSize = n * sizeof(AudioStreamRangedDescription);
             break;
@@ -855,13 +967,16 @@ static OSStatus APUSB_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectI
     return err;
 }
 
-static OSStatus request_rate(Float64 rate)
+static OSStatus request_config(const apusb_mode *m, Float64 rate)
 {
-    if (!apusb_mode_supports_rate(gMode, rate)) return kAudioHardwareIllegalOperationError;
-    if (rate == gSampleRate) return kAudioHardwareNoError;
+    if (m == NULL || !apusb_mode_supports_rate(m, rate)) return kAudioDeviceUnsupportedFormatError;
+    if (m == gMode && rate == gSampleRate) return kAudioHardwareNoError;
+    gPendingMode = m;
     gPendingRate = rate;
-    return gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device, kChange_SampleRate, NULL);
+    return gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device, kChange_Mode, NULL);
 }
+
+static OSStatus request_rate(Float64 rate) { return request_config(mode_for(0, rate, -1), rate); }
 
 static OSStatus APUSB_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID id, pid_t pid, const AudioObjectPropertyAddress *a,
                                       UInt32 qs, const void *q, UInt32 size, const void *data)
@@ -876,9 +991,15 @@ static OSStatus APUSB_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectI
         if (size != sizeof(AudioStreamBasicDescription)) err = kAudioHardwareBadPropertySizeError;
         else {
             const AudioStreamBasicDescription *f = (const AudioStreamBasicDescription *)data;
-            if (f->mFormatID != kAudioFormatLinearPCM || f->mChannelsPerFrame != kChannels || f->mBitsPerChannel != 32)
+            int dir = id == kObjectID_Stream_Input ? 1 : 0;
+            if (f->mFormatID != kAudioFormatLinearPCM || f->mChannelsPerFrame != kChannels)
                 err = kAudioDeviceUnsupportedFormatError;
-            else err = request_rate(f->mSampleRate);
+            else if (a->mSelector == kAudioStreamPropertyVirtualFormat)
+                err = f->mBitsPerChannel == 32 ? request_config(mode_for(0, f->mSampleRate, dir), f->mSampleRate)
+                                               : kAudioDeviceUnsupportedFormatError;
+            else if (f->mBitsPerChannel == 16 || f->mBitsPerChannel == 24)
+                err = request_config(mode_for(f->mBitsPerChannel, f->mSampleRate, dir), f->mSampleRate);
+            else err = kAudioDeviceUnsupportedFormatError;
         }
     } else if (id == kObjectID_Device && a->mSelector == kAudiophilePropertyMode) {
         if (size != sizeof(CFStringRef)) err = kAudioHardwareBadPropertySizeError;
@@ -893,6 +1014,7 @@ static OSStatus APUSB_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectI
             else if (m == gMode) err = kAudioHardwareNoError;
             else {
                 gPendingMode = m;
+                gPendingRate = 0;
                 err = gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device, kChange_Mode, NULL);
             }
         }

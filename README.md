@@ -6,68 +6,60 @@ An **unofficial, open-source (MIT)** driver for the **M-Audio Audiophile USB**
 > ⚠️ **EXPERIMENTAL · UNSIGNED** — installs no kernel extension and changes no SIP
 > or other security setting. Not affiliated with M-Audio / inMusic.
 
-## Status on real hardware (tested 2026-11-21)
+## Status on real hardware (tested 2026-11-21, macOS 12.7.6, MacBook Pro 2015)
 
-Tested on a MacBook Pro 12,1 (2015) running **macOS 12.7.6**, with an Audiophile USB
-(`0763:2003`, bcdDevice 1.01) on a USB hub.
+**Why the card is "pure noise" with macOS's built-in driver.** Measured on a
+real unit, with nothing plugged into the inputs:
+- **24-bit samples are big-endian.** Recording the silent input as S24_3BE gives
+  −72 dBFS RMS. Reading the same data as little-endian, which is what AppleUSBAudio
+  uses, gives −5 dBFS of noise.
+- **16-bit samples are little-endian.** S16LE gives −72 dBFS; S16BE gives −24 dBFS.
+- **The card remembers the configuration it last streamed in.** After a different bit
+  depth or rate range has been used, even a correctly formatted stream reads as
+  −5 dBFS garbage. A USB re-enumeration restores it to −70…−97 dBFS. Apple's driver
+  runs its four engines in mixed depths and rates and never re-enumerates, which is
+  why 16-bit was noisy as well.
 
-| Feature | Status | Evidence |
-|---|---|---|
-| **MIDI in/out** (this driver) | ✅ **Works at the CoreMIDI level.** The driver loads in MIDIServer and the device appears as *Audiophile USB* with one source and one destination. `MIDISend` returns OK. | `apusb-diag coremidi-list` / `coremidi-test`. Incoming MIDI and audible output on a synth **still need checking with a MIDI cable or synth** (none was connected). |
-| **Audio playback** | ✅ Provided by **macOS's built-in AppleUSBAudio** (416.2), not by this driver. It shows 4 devices called "Audiophile USB (tm)": analog out, digital out, analog in and digital in. | `system_profiler SPAudioDataType`. A test tone at 32/64/128-frame buffers ran with 0 overloads (`apusb-diag hal-test`). Nobody has listened to the output yet. |
-| **Audio recording** | ⚠️ Shows up in Core Audio through AppleUSBAudio. Not measured: macOS microphone permission (TCC) blocks capture from an SSH session. | Run `apusb-diag hal-test --uid "…:4"` from Terminal on the Mac itself and allow microphone access. |
-| Our HAL audio driver | ⏸ **Stays inactive by design** while AppleUSBAudio owns the audio interfaces. macOS claims interfaces 1–5 *exclusively*, and user space can't take them over without a kext. The plug-in detects this, logs it, and publishes **no** duplicate or dead device. | Log: `AppleUSBAudio owns the audio interfaces; not publishing a duplicate device`. |
+**What this package does now:**
 
-**Recommendation:** in your DAW, use Apple's "Audiophile USB (tm)" devices for audio and
-this driver's "Audiophile USB" port for MIDI.
+| Part | What it does |
+|---|---|
+| `audiophileusbd` (root LaunchDaemon) | Takes the device away from AppleUSBAudio with `USBDeviceReEnumerate(kUSBReEnumerateCaptureDeviceMask)`. Apple documents this IOUSBLib call for root processes. No kext, no SIP or other security change. Each time the audio configuration changes, it re-enumerates the device so the firmware starts clean. When it stops (uninstall or `launchctl bootout`), it hands the device back to macOS. |
+| `AudiophileUSB.driver` (Core Audio) | A single **"Audiophile USB"** device from **M-Audio**, 2 in / 2 out. Physical formats: 16-bit 44.1/48 kHz, 24-bit 44.1/48 kHz, and 24-bit 88.2/96 kHz (half duplex, as on the hardware). Sends 24-bit big-endian and 16-bit little-endian. |
+| `AudiophileUSBMIDI.plugin` (CoreMIDI) | MIDI in/out on interface 6. |
 
-If 24-bit playback sounds like loud noise, the device may expect big-endian samples in
-24-bit modes. Apple's driver uses little-endian here (format flags 0xC). Switch the
-device to 16-bit in *Audio MIDI Setup → Format* and compare. Please report the result.
+**Measured over USB with the driver installed:**
+- Apple's four generic "Audiophile USB (tm)" devices are gone. `system_profiler` shows
+  one *Audiophile USB / M-Audio / 2 in / 2 out*.
+- A 1 kHz tone at −30 dBFS played through Core Audio for 3 s in each configuration
+  below. Every run had **0 USB errors, 0 resyncs and 0 overloads**:
 
-### Latency, as Core Audio reports it (native AppleUSBAudio devices)
-
-| Device | Rate | Device latency | Safety offset | Buffer range |
+| Configuration | IO buffer | IOProc avg / max | Client CPU | Silent-input peak (driver log) |
 |---|---|---|---|---|
-| Analog out (`…:2`) | 44.1 kHz | 45 frames | 69 frames | 14–4096 |
-| Analog in (`…:4`) | 48 kHz | 48 frames | 162 frames | 15–4096 |
-| Digital in (`…:5`) | 96 kHz | 96 frames | 324 frames | 29–4096 |
+| 24-bit 48 kHz | 64 | 2.4 / 14.4 µs | 1.0 % | −55 dBFS |
+| 24-bit 44.1 kHz | 32 | 1.4 / 13.9 µs | 1.6 % | −82 dBFS |
+| 16-bit 44.1 kHz | 64 | 2.3 / 14.0 µs | 0.9 % | −36 dBFS ⚠️ (higher; under investigation) |
 
-Measured with a 1 kHz tone at −30 dBFS, 3 s, through `apusb-diag hal-test` on the output
-device:
-
-| IO buffer | Overloads | IOProc time avg / max | Client CPU | coreaudiod CPU |
-|---|---|---|---|---|
-| 32 frames | 0 | 1.2 µs / 11.8 µs | 1.5 % | ~0–5 % |
-| 64 frames | 0 | 2.2 µs / 13.5 µs | 0.9 % | ~0–5 % |
-| 128 frames | 0 | 3.4 µs / 22.3 µs | 0.7 % | ~5 % |
-
-**Calculated** one-way latency at a 64-frame buffer:
-- Output: 64 + 45 + 69 = 178 frames, about **4.0 ms** at 44.1 kHz.
-- Input: 64 + 48 + 162 = 274 frames, about **5.7 ms** at 48 kHz.
-
-That gives a round trip of about **9–10 ms**, plus about 1 ms of converter delay that the
-device doesn't report. At a 32-frame buffer each direction is about 0.7 ms shorter.
-
-This is **not** zero latency. No loopback cable was connected, so the round trip hasn't
-been measured. To measure it, connect a cable from the output to the input and run
-`apusb-diag hal-test --loopback`.
-
-For when the HAL path is active (when AppleUSBAudio doesn't own the device), its
-user-space isochronous engine is tuned like this:
-- 1 ms USB frames, 4 transfers × 2 frames in flight.
-- A time-constraint (real-time) thread.
-- No locks or allocations in the IO path.
-
-It reports a safety offset of 3 ms and an output latency of 6 ms. Those figures are design
-values and haven't been measured on hardware.
+- **Not yet confirmed by ear.** A clean-sounding tone and music still need to be heard
+  by a person. Please report what you hear.
+- **Latency reported to Core Audio** (design values) at 48 kHz:
+  - Output: 288 frames (6 ms) plus a 144-frame (3 ms) safety offset.
+  - Input: 96 frames (2 ms) plus 144 frames.
+  - Add your IO buffer, e.g. 64 frames.
+- **MIDI.** Sending a note on/off over USB worked. CoreMIDI-level testing needs a
+  logged-in GUI session.
+- **Known issues:**
+  - Changing format or rate costs about 1.3 s, because the device is re-enumerated.
+  - Once, a test process took about 5 minutes to exit after stopping an isochronous
+    stream. This is being investigated.
 
 M-Audio's last Mac driver (1.8.1) supports only OS X 10.6/10.7. This project replaces
 it with user-space components:
 
 | Component | Installed to | What it does |
 |---|---|---|
-| `AudiophileUSB.driver` | `/Library/Audio/Plug-Ins/HAL/` | Core Audio (AudioServerPlugIn) driver: 2 in / 2 out over IOUSBLib. It stays dormant while Apple's AppleUSBAudio owns the device, which is the normal case on macOS 12. |
+| `AudiophileUSB.driver` | `/Library/Audio/Plug-Ins/HAL/` | Core Audio (AudioServerPlugIn) driver: one "Audiophile USB" device, 2 in / 2 out, over IOUSBLib |
+| `audiophileusbd` | `/Library/Application Support/AudiophileUSB/` + `/Library/LaunchDaemons/` | Root helper that detaches AppleUSBAudio and resets the device on configuration changes |
 | `AudiophileUSBMIDI.plugin` | `/Library/Audio/MIDI Drivers/` | CoreMIDI driver for the MIDI in/out port |
 | `apusb-diag` | `/usr/local/bin/` | Diagnostics and direct hardware tests (descriptors, tone, record, MIDI) |
 | `collect-diagnostics.command` | `/Library/Application Support/AudiophileUSB/` | Read-only report generator (double-click) |

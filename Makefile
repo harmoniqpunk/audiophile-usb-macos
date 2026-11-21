@@ -23,9 +23,10 @@ USB_SRC        := src/common/apusb_usb.c src/common/apusb_stream.c
 HAL_BUNDLE     := $(BUILD)/AudiophileUSB.driver
 MIDI_BUNDLE    := $(BUILD)/AudiophileUSBMIDI.plugin
 DIAG           := $(BUILD)/apusb-diag
+DAEMON         := $(BUILD)/audiophileusbd
 
 .PHONY: all test smoke pkg clean
-all: $(HAL_BUNDLE) $(MIDI_BUNDLE) $(DIAG)
+all: $(HAL_BUNDLE) $(MIDI_BUNDLE) $(DIAG) $(DAEMON)
 
 $(HAL_BUNDLE): src/hal/AudiophileUSBDriver.c src/hal/Info.plist $(PORTABLE_SRC) $(USB_SRC) src/common/*.h
 	@mkdir -p $@/Contents/MacOS $@/Contents/Resources
@@ -45,6 +46,11 @@ $(DIAG): src/diag/apusb-diag.c $(PORTABLE_SRC) $(USB_SRC) src/common/*.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/diag/apusb-diag.c $(PORTABLE_SRC) $(USB_SRC) \
 	    $(LDFLAGS) -framework CoreFoundation -framework CoreAudio -framework CoreMIDI -framework IOKit
+	codesign --force --sign "$(SIGN_ID)" --timestamp=none $@
+
+$(DAEMON): src/daemon/audiophileusbd.c src/common/apusb_usb.c src/common/*.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ src/daemon/audiophileusbd.c src/common/apusb_usb.c $(LDFLAGS) -framework CoreFoundation -framework IOKit
 	codesign --force --sign "$(SIGN_ID)" --timestamp=none $@
 
 test:

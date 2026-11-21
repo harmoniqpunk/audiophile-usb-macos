@@ -45,7 +45,7 @@ IOReturn apusb_device_create(io_service_t service, apusb_device *out)
     IOReturn kr = IOCreatePlugInInterfaceForService(service, kIOUSBDeviceUserClientTypeID,
                                                     kIOCFPlugInInterfaceID, &plug, &score);
     if (kr != kIOReturnSuccess || plug == NULL) return kr ? kr : kIOReturnError;
-    HRESULT hr = (*plug)->QueryInterface(plug, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID),
+    HRESULT hr = (*plug)->QueryInterface(plug, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID650),
                                          (LPVOID *)&out->dev);
     IODestroyPlugInInterface(plug);
     if (hr != S_OK || out->dev == NULL) return kIOReturnUnsupported;
@@ -66,6 +66,7 @@ void apusb_device_release(apusb_device *d)
 
 IOReturn apusb_device_ensure_configured(apusb_device *d)
 {
+    if (d->dev == NULL) return kIOReturnSuccess; /* attached only: interfaces exist => configured */
     UInt8 current = 0;
     IOReturn kr = (*d->dev)->GetConfiguration(d->dev, &current);
     if (kr == kIOReturnSuccess && current != 0) return kIOReturnSuccess;
@@ -82,39 +83,59 @@ IOReturn apusb_device_ensure_configured(apusb_device *d)
     return kr;
 }
 
+static int reg_int(io_registry_entry_t e, CFStringRef key)
+{
+    int v = -1;
+    CFTypeRef n = IORegistryEntryCreateCFProperty(e, key, kCFAllocatorDefault, 0);
+    if (n) {
+        if (CFGetTypeID(n) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)n, kCFNumberIntType, &v);
+        CFRelease(n);
+    }
+    return v;
+}
+
+/* Interfaces are looked up as registry children of the device (not through a
+ * device user client): that works even while another process (our capture
+ * daemon) holds the device itself exclusively. */
 static IOReturn find_interface(apusb_device *d, UInt8 number, apusb_intf_ref *out)
 {
-    IOUSBFindInterfaceRequest req = {
-        .bInterfaceClass = kIOUSBFindInterfaceDontCare,
-        .bInterfaceSubClass = kIOUSBFindInterfaceDontCare,
-        .bInterfaceProtocol = kIOUSBFindInterfaceDontCare,
-        .bAlternateSetting = kIOUSBFindInterfaceDontCare,
-    };
     io_iterator_t it = 0;
-    IOReturn kr = (*d->dev)->CreateInterfaceIterator(d->dev, &req, &it);
+    IOReturn kr = IORegistryEntryGetChildIterator(d->service, kIOServicePlane, &it);
     if (kr != kIOReturnSuccess) return kr;
-
     io_service_t s;
     IOReturn result = kIOReturnNotFound;
     while ((s = IOIteratorNext(it)) != 0) {
+        if (!IOObjectConformsTo(s, "IOUSBHostInterface") || reg_int(s, CFSTR("bInterfaceNumber")) != number) {
+            IOObjectRelease(s);
+            continue;
+        }
         IOCFPlugInInterface **plug = NULL;
         SInt32 score = 0;
         apusb_intf_ref intf = NULL;
-        if (IOCreatePlugInInterfaceForService(s, kIOUSBInterfaceUserClientTypeID,
-                                              kIOCFPlugInInterfaceID, &plug, &score) == kIOReturnSuccess && plug) {
+        result = IOCreatePlugInInterfaceForService(s, kIOUSBInterfaceUserClientTypeID,
+                                                   kIOCFPlugInInterfaceID, &plug, &score);
+        if (result == kIOReturnSuccess && plug) {
             (*plug)->QueryInterface(plug, CFUUIDGetUUIDBytes(kIOUSBInterfaceInterfaceID300),
                                     (LPVOID *)&intf);
             IODestroyPlugInInterface(plug);
         }
         IOObjectRelease(s);
-        if (intf == NULL) continue;
-        UInt8 n = 0xff;
-        (*intf)->GetInterfaceNumber(intf, &n);
-        if (n == number) { *out = intf; result = kIOReturnSuccess; break; }
-        (*intf)->Release(intf);
+        if (intf) { *out = intf; result = kIOReturnSuccess; break; }
+        if (result == kIOReturnSuccess) result = kIOReturnUnsupported;
     }
     IOObjectRelease(it);
     return result;
+}
+
+IOReturn apusb_device_attach(io_service_t service, apusb_device *out)
+{
+    memset(out, 0, sizeof *out);
+    IOObjectRetain(service);
+    out->service = service;
+    out->vendorID = (UInt16)reg_int(service, CFSTR("idVendor"));
+    out->productID = (UInt16)reg_int(service, CFSTR("idProduct"));
+    out->locationID = (UInt32)reg_int(service, CFSTR("locationID"));
+    return kIOReturnSuccess;
 }
 
 IOReturn apusb_interface_open(apusb_device *d, UInt8 number, bool seize, apusb_interface *out)
@@ -225,4 +246,14 @@ const char *apusb_strerror(IOReturn r)
         return buf;
     }
     }
+}
+
+IOReturn apusb_device_capture(apusb_device *d, bool capture)
+{
+    if (d->dev == NULL) return kIOReturnNotOpen;
+    IOUSBDeviceInterface650 **dev = (IOUSBDeviceInterface650 **)d->dev;
+    IOReturn kr = (*dev)->USBDeviceReEnumerate(dev, capture ? kUSBReEnumerateCaptureDeviceMask
+                                                            : kUSBReEnumerateReleaseDeviceMask);
+    if (kr == kIOReturnSuccess && capture) usleep(1500 * 1000); /* let kernel drivers terminate */
+    return kr;
 }

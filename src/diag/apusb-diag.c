@@ -24,6 +24,8 @@
  */
 #include <CoreAudio/CoreAudio.h>
 #include <CoreMIDI/CoreMIDI.h>
+#include <notify.h>
+#include "apusb_reset.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach_time.h>
 #include <math.h>
@@ -75,6 +77,11 @@ static int open_device(apusb_device *d, bool quiet)
         return 1;
     }
     IOReturn kr = apusb_device_create(s, d);
+    if (kr != kIOReturnSuccess) {
+        /* audiophileusbd holds the device: interfaces can still be opened */
+        kr = apusb_device_attach(s, d);
+        if (!kr && !quiet) fprintf(stderr, "(device held by audiophileusbd: using interfaces directly)\n");
+    }
     IOObjectRelease(s);
     if (kr) { fprintf(stderr, "cannot create device interface: %s\n", apusb_strerror(kr)); return 1; }
     return 0;
@@ -129,6 +136,12 @@ static int cmd_descriptors(void)
 {
     apusb_device d;
     if (open_device(&d, false)) return 1;
+    if (!d.dev) {
+        fprintf(stderr, "descriptors need the device itself; stop audiophileusbd first:\n"
+                        "  sudo launchctl bootout system/com.harmoniqpunk.audiophileusbd\n");
+        apusb_device_release(&d);
+        return 1;
+    }
     UInt8 cls = 0, sub = 0, proto = 0, ncfg = 0, cur = 0;
     UInt16 rel = 0;
     (*d.dev)->GetDeviceClass(d.dev, &cls);
@@ -260,6 +273,7 @@ typedef struct {
     unsigned     buffer;
     double       level;
     bool         loopback;
+    bool         capture;
 } stream_opts;
 
 typedef struct {
@@ -269,6 +283,8 @@ typedef struct {
     FILE        *wav;
     uint64_t     framesRecorded;
     float        peak;
+    double       amp;
+    double       sumsq;
 } stream_ctx;
 
 static unsigned tone_frames(void *c) { return apusb_pacer_next(&((stream_ctx *)c)->pacer, 0); }
@@ -280,7 +296,7 @@ static void tone_fill(void *c, uint8_t *dst, unsigned frames)
     while (frames) {
         unsigned n = frames > 128 ? 128 : frames;
         for (unsigned i = 0; i < n; i++) {
-            float v = (float)(0.1 * sin(x->phase)); /* -20 dBFS */
+            float v = (float)(x->amp * sin(x->phase));
             x->phase += x->step;
             if (x->phase > 2 * M_PI) x->phase -= 2 * M_PI;
             buf[2 * i] = buf[2 * i + 1] = v;
@@ -299,7 +315,7 @@ static void rec_consume(void *c, const uint8_t *src, unsigned frames)
     while (frames) {
         unsigned n = frames > 128 ? 128 : frames;
         apusb_pcm_to_float(src, buf, n, 2, x->fmt);
-        for (unsigned i = 0; i < 2 * n; i++) if (fabsf(buf[i]) > x->peak) x->peak = fabsf(buf[i]);
+        for (unsigned i = 0; i < 2 * n; i++) { if (fabsf(buf[i]) > x->peak) x->peak = fabsf(buf[i]); x->sumsq += (double)buf[i] * buf[i]; }
         apusb_float_to_pcm(buf, le, n, 2, APUSB_FMT_S24_3LE);
         if (x->wav) fwrite(le, 6, n, x->wav);
         x->framesRecorded += n;
@@ -338,10 +354,17 @@ static int run_stream(bool capture, const stream_opts *o)
     stream_ctx ctx = { .fmt = o->haveFormat ? o->format : mode->format };
     apusb_pacer_init(&ctx.pacer, (uint32_t)rate);
     ctx.step = 2 * M_PI * 1000.0 / rate;
+    ctx.amp = pow(10.0, (o->level != 0 ? o->level : -30.0) / 20.0);
 
     apusb_device d;
     if (open_device(&d, false)) return 1;
-    IOReturn kr = apusb_device_ensure_configured(&d);
+    IOReturn kr;
+    if (o->capture && d.dev) {
+        kr = apusb_device_capture(&d, true);
+        printf("capture device from macOS drivers (needs root): %s\n", apusb_strerror(kr));
+        if (kr) { apusb_device_release(&d); return 1; }
+    }
+    kr = apusb_device_ensure_configured(&d);
     if (kr) fprintf(stderr, "ensure configuration: %s (continuing)\n", apusb_strerror(kr));
 
     apusb_interface intf[APUSB_IF_STREAM_LAST + 1];
@@ -377,7 +400,7 @@ static int run_stream(bool capture, const stream_opts *o)
     s = apusb_stream_create(it, &pipe, capture, 2 * apusb_format_bytes(ctx.fmt), o->xfers, o->framesPerXfer, &cb);
     if (!s) { fprintf(stderr, "cannot create stream\n"); goto out; }
     if ((kr = apusb_stream_start(s))) { fprintf(stderr, "start stream: %s\n", apusb_strerror(kr)); goto out; }
-    printf("%s for %.1f s ...\n", capture ? "recording" : "playing 1 kHz tone at -20 dBFS", o->seconds);
+    printf("%s for %.1f s ...\n", capture ? "recording" : "playing 1 kHz tone", o->seconds);
     usleep((useconds_t)(o->seconds * 1e6));
     apusb_stream_stop(s);
     uint64_t pk = 0, er = 0, rs = 0;
@@ -386,6 +409,8 @@ static int run_stream(bool capture, const stream_opts *o)
     if (capture) {
         printf("recorded %llu frames (%.2f s), peak %.1f dBFS -> %s\n", (unsigned long long)ctx.framesRecorded,
                ctx.framesRecorded / rate, ctx.peak > 0 ? 20 * log10(ctx.peak) : -200.0, o->out ? o->out : "apusb-record.wav");
+        double rms = ctx.framesRecorded ? sqrt(ctx.sumsq / (2.0 * ctx.framesRecorded)) : 0;
+        printf("RMS %.1f dBFS (silent input: ~-80..-100 if byte order is right, ~-5..-20 if wrong)\n", rms > 0 ? 20 * log10(rms) : -200.0);
         printf("If the recording sounds like loud noise, retry with a different --format (byte order).\n");
     } else {
         printf("If you heard noise instead of a clean tone, retry with a different --format (byte order).\n");
@@ -397,6 +422,7 @@ out:
     for (int i = APUSB_IF_STREAM_FIRST; i <= APUSB_IF_STREAM_LAST; i++) {
         if (intf[i].intf) { apusb_interface_set_alt(&intf[i], 0); apusb_interface_close(&intf[i]); }
     }
+    if (o->capture && d.dev) printf("release device to macOS: %s\n", apusb_strerror(apusb_device_capture(&d, false)));
     apusb_device_release(&d);
     return rc;
 }
@@ -499,6 +525,21 @@ static int cmd_get_mode(void)
     printf("%s\n", buf);
     CFRelease(s);
     return 0;
+}
+
+static int cmd_reset(void)
+{
+    int tok = -1; uint64_t before = 0, now = 0;
+    if (notify_register_check(APUSB_NOTIFY_RESET_DONE, &tok) != NOTIFY_STATUS_OK) { fprintf(stderr, "notify failed\n"); return 1; }
+    int chk = 0; notify_check(tok, &chk); notify_get_state(tok, &before);
+    notify_post(APUSB_NOTIFY_RESET_REQUEST);
+    for (int i = 0; i < 100; i++) {
+        usleep(50000);
+        notify_get_state(tok, &now);
+        if (now != before) { printf("device reset by audiophileusbd (generation %llu)\n", (unsigned long long)now); return 0; }
+    }
+    fprintf(stderr, "no answer from audiophileusbd within 5 s (is it installed/running?)\n");
+    return 1;
 }
 
 static int cmd_set_mode(const char *name)
@@ -681,11 +722,17 @@ static AudioObjectID device_by_uid(const char *uidStr)
     return dev;
 }
 
-static int cmd_hal_test(const char *uid, unsigned buffer, double seconds, bool loopback, double level)
+static int cmd_hal_test(const char *uid, unsigned buffer, double seconds, bool loopback, double level, double reqRate)
 {
     AudioObjectID dev = device_by_uid(uid ? uid : kDeviceUID);
     if (dev == kAudioObjectUnknown) { fprintf(stderr, "Core Audio device '%s' not found\n", uid ? uid : kDeviceUID); return 1; }
     AudioObjectPropertyAddress a = { kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    if (reqRate > 0) {
+        AudioObjectPropertyAddress r = { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        OSStatus e = AudioObjectSetPropertyData(dev, &r, 0, NULL, sizeof reqRate, &reqRate);
+        if (e) fprintf(stderr, "set sample rate %.0f: %d\n", reqRate, (int)e);
+        usleep(500000);
+    }
     UInt32 bs = buffer;
     OSStatus err = AudioObjectSetPropertyData(dev, &a, 0, NULL, sizeof bs, &bs);
     if (err) fprintf(stderr, "set buffer size %u: %d\n", buffer, (int)err);
@@ -826,7 +873,7 @@ int main(int argc, char **argv)
     if (argc < 2) { usage(); return 2; }
     const char *cmd = argv[1];
     stream_opts o = { .mode = apusb_mode_default()->name, .seconds = 5.0,
-                      .buffer = 64, .level = -20.0, .xfers = APUSB_STREAM_DEFAULT_XFERS, .framesPerXfer = APUSB_STREAM_DEFAULT_FRAMES_PER_XFER };
+                      .buffer = 64, .level = -30.0, .xfers = APUSB_STREAM_DEFAULT_XFERS, .framesPerXfer = APUSB_STREAM_DEFAULT_FRAMES_PER_XFER };
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
         const char *v = (i + 1 < argc) ? argv[i + 1] : NULL;
@@ -843,6 +890,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--buffer") && v) { o.buffer = (unsigned)atoi(v); i++; }
         else if (!strcmp(a, "--level") && v) { o.level = atof(v); i++; }
         else if (!strcmp(a, "--loopback")) o.loopback = true;
+        else if (!strcmp(a, "--capture")) o.capture = true;
         else if (!strcmp(a, "--xfers") && v) { o.xfers = (unsigned)atoi(v); i++; }
         else if (!strcmp(a, "--frames-per-xfer") && v) { o.framesPerXfer = (unsigned)atoi(v); i++; }
         else if (!strcmp(cmd, "set-mode") && i == 2) { /* positional */ }
@@ -857,10 +905,11 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "midi-monitor")) return cmd_midi_monitor(o.seconds);
     if (!strcmp(cmd, "midi-test")) return cmd_midi_test();
     if (!strcmp(cmd, "get-mode")) return cmd_get_mode();
+    if (!strcmp(cmd, "reset")) return cmd_reset();
     if (!strcmp(cmd, "hal-list")) return cmd_hal_list();
     if (!strcmp(cmd, "coremidi-list")) return cmd_coremidi_list();
     if (!strcmp(cmd, "coremidi-test")) return cmd_coremidi_test(o.seconds);
-    if (!strcmp(cmd, "hal-test")) return cmd_hal_test(o.uid, o.buffer, o.seconds, o.loopback, o.level);
+    if (!strcmp(cmd, "hal-test")) return cmd_hal_test(o.uid, o.buffer, o.seconds, o.loopback, o.level, o.rate);
     if (!strcmp(cmd, "set-mode")) { if (argc < 3) { usage(); return 2; } return cmd_set_mode(argv[2]); }
     usage();
     return 2;

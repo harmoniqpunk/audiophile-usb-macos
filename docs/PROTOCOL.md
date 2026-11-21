@@ -102,3 +102,32 @@ Facts as observable in the publicly documented behaviour of the Linux
   `USBInterfaceOpenSeize` fails. Interface 6 (MIDI) is left unclaimed.
 - On 12.7, `IOServiceMatching("IOUSBHostDevice")` with plain `idVendor` keys returns
   nothing. Use `kIOPropertyMatchKey`.
+
+## Byte order and state, measured on hardware (2026-11-21)
+
+Method: record the analog input with nothing connected, then compare the RMS level
+when the data is decoded each way. The correct byte order gives about −70 to −97
+dBFS; the wrong one gives about −5 to −25 dBFS.
+
+| Alt | Bits | Decoded as | RMS |
+|---|---|---|---|
+| 5 | 16 | S16LE | −72.0 dBFS ✅ |
+| 5 | 16 | S16BE | −24.0 dBFS |
+| 3 | 24 | S24_3BE | −71.8 dBFS ✅ |
+| 3 | 24 | S24_3LE | −4.8 dBFS (this is what AppleUSBAudio does) |
+
+**State:** after the device has streamed in another configuration, all four tests
+above read about −4.7 dBFS. A USB re-enumeration restores the clean values. The
+driver therefore asks `audiophileusbd` to re-enumerate the device before starting
+in a configuration that differs from the last one. The request goes over Darwin
+notifications (`com.harmoniqpunk.audiophileusb.reset-request` / `reset-done`), which
+the AudioServerPlugIn sandbox allows.
+
+**Capture:** `USBDeviceReEnumerate(kUSBReEnumerateCaptureDeviceMask)`, run as root,
+terminates AppleUSBAudio on interfaces 1–5 and also releases MIDIServer's client.
+While the device is captured, any process can open the interfaces through
+IOUSBHostInterface user clients. That was tested as george, `_coreaudiod` and root.
+Only a new *device* user client fails (0xe00002be).
+
+The original M-Audio 1.8.1 driver couldn't be analysed. The only reachable copy
+(rebyte.me) is behind a reCAPTCHA, and inMusic's CDN no longer hosts it.

@@ -84,8 +84,28 @@ int main(int argc, char **argv)
     size = sizeof rate;
     (*gDrv)->GetPropertyData(gDrv, 2, 0, &a, 0, NULL, size, &size, &rate);
     CHECK(rate == 44100.0);
-    rate = 96000.0;
-    CHECK((*gDrv)->SetPropertyData(gDrv, 2, 0, &a, 0, NULL, sizeof rate, &rate) != 0); /* not valid in 24bit-48k */
+    rate = 96000.0; /* switches to the half-duplex 24bit-96k-play mode */
+    CHECK((*gDrv)->SetPropertyData(gDrv, 2, 0, &a, 0, NULL, sizeof rate, &rate) == 0);
+    flush_requests();
+    size = sizeof rate;
+    (*gDrv)->GetPropertyData(gDrv, 2, 0, &a, 0, NULL, size, &size, &rate);
+    CHECK(rate == 96000.0);
+    rate = 48000.0; /* back to full duplex */
+    CHECK((*gDrv)->SetPropertyData(gDrv, 2, 0, &a, 0, NULL, sizeof rate, &rate) == 0);
+    flush_requests();
+    /* physical format 16-bit -> 16bit-48k mode */
+    {
+        AudioObjectPropertyAddress pf = { kAudioStreamPropertyPhysicalFormat, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        AudioStreamBasicDescription f = { 0 }; size = sizeof f;
+        (*gDrv)->GetPropertyData(gDrv, 4, 0, &pf, 0, NULL, size, &size, &f);
+        CHECK(f.mBitsPerChannel == 24 && (f.mFormatFlags & kAudioFormatFlagIsBigEndian));
+        f.mBitsPerChannel = 16; f.mSampleRate = 44100.0;
+        CHECK((*gDrv)->SetPropertyData(gDrv, 4, 0, &pf, 0, NULL, sizeof f, &f) == 0);
+        flush_requests();
+        size = sizeof f;
+        (*gDrv)->GetPropertyData(gDrv, 4, 0, &pf, 0, NULL, size, &size, &f);
+        CHECK(f.mBitsPerChannel == 16 && f.mSampleRate == 44100.0 && !(f.mFormatFlags & kAudioFormatFlagIsBigEndian));
+    }
 
     a.mSelector = 'apmd';
     CFStringRef mode = CFSTR("24bit-96k-play");
