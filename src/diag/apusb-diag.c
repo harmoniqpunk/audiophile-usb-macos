@@ -54,10 +54,11 @@ static void usage(void)
         "  tone   [--mode M] [--rate HZ] [--seconds N] [--format F] [--seize]\n"
         "  record [--mode M] [--rate HZ] [--seconds N] [--format F] [--seize] [--out FILE]\n"
         "  midi-monitor [--seconds N] | midi-test\n"
-        "  get-mode | set-mode NAME\n"
+        "  get-mode | set-mode NAME | reset [--method 1..4]\n"
         "  hal-list                                   Core Audio devices with latency / safety offsets\n"
         "  coremidi-list | coremidi-test [--seconds N]   (through the installed CoreMIDI driver)\n"
-        "  hal-test [--uid UID] [--buffer N] [--seconds N] [--level dBFS] [--loopback]\n");
+        "  hal-test [--uid UID] [--buffer N] [--seconds N] [--level dBFS] [--rate HZ]\n"
+        "           [--loopback | --sweep] [--channel 0|1] [--out FILE (input+output dump)]\n");
 }
 
 /* ------------------------------------------------------------------------ */
@@ -273,6 +274,9 @@ typedef struct {
     unsigned     buffer;
     double       level;
     bool         loopback;
+    int          channel;   /* hal-test: -1 = all channels */
+    int          method;    /* reset method (apusb_reset.h) */
+    bool         sweep;     /* hal-test: log sine sweep 50 Hz .. 15 kHz instead of 1 kHz */
     bool         capture;
 } stream_opts;
 
@@ -284,7 +288,8 @@ typedef struct {
     uint64_t     framesRecorded;
     float        peak;
     double       amp;
-    double       sumsq;
+    double       sumsq, sumsqLate;
+    uint64_t     framesLate;
 } stream_ctx;
 
 static unsigned tone_frames(void *c) { return apusb_pacer_next(&((stream_ctx *)c)->pacer, 0); }
@@ -316,6 +321,10 @@ static void rec_consume(void *c, const uint8_t *src, unsigned frames)
         unsigned n = frames > 128 ? 128 : frames;
         apusb_pcm_to_float(src, buf, n, 2, x->fmt);
         for (unsigned i = 0; i < 2 * n; i++) { if (fabsf(buf[i]) > x->peak) x->peak = fabsf(buf[i]); x->sumsq += (double)buf[i] * buf[i]; }
+        if (x->framesRecorded >= 4800) { /* skip the first ~100 ms (start-up transient) */
+            for (unsigned i = 0; i < 2 * n; i++) x->sumsqLate += (double)buf[i] * buf[i];
+            x->framesLate += n;
+        }
         apusb_float_to_pcm(buf, le, n, 2, APUSB_FMT_S24_3LE);
         if (x->wav) fwrite(le, 6, n, x->wav);
         x->framesRecorded += n;
@@ -411,6 +420,8 @@ static int run_stream(bool capture, const stream_opts *o)
                ctx.framesRecorded / rate, ctx.peak > 0 ? 20 * log10(ctx.peak) : -200.0, o->out ? o->out : "apusb-record.wav");
         double rms = ctx.framesRecorded ? sqrt(ctx.sumsq / (2.0 * ctx.framesRecorded)) : 0;
         printf("RMS %.1f dBFS (silent input: ~-80..-100 if byte order is right, ~-5..-20 if wrong)\n", rms > 0 ? 20 * log10(rms) : -200.0);
+        double late = ctx.framesLate ? sqrt(ctx.sumsqLate / (2.0 * ctx.framesLate)) : 0;
+        printf("RMS after first 100 ms %.1f dBFS\n", late > 0 ? 20 * log10(late) : -200.0);
         printf("If the recording sounds like loud noise, retry with a different --format (byte order).\n");
     } else {
         printf("If you heard noise instead of a clean tone, retry with a different --format (byte order).\n");
@@ -527,16 +538,20 @@ static int cmd_get_mode(void)
     return 0;
 }
 
-static int cmd_reset(void)
+static int cmd_reset(int method)
 {
     int tok = -1; uint64_t before = 0, now = 0;
+    if (method > 0) {
+        int rt = -1;
+        if (notify_register_check(APUSB_NOTIFY_RESET_REQUEST, &rt) == NOTIFY_STATUS_OK) { notify_set_state(rt, (uint64_t)method); notify_cancel(rt); }
+    }
     if (notify_register_check(APUSB_NOTIFY_RESET_DONE, &tok) != NOTIFY_STATUS_OK) { fprintf(stderr, "notify failed\n"); return 1; }
     int chk = 0; notify_check(tok, &chk); notify_get_state(tok, &before);
     notify_post(APUSB_NOTIFY_RESET_REQUEST);
-    for (int i = 0; i < 100; i++) {
+    for (int i = 0; i < 200; i++) {
         usleep(50000);
         notify_get_state(tok, &now);
-        if (now != before) { printf("device reset by audiophileusbd (generation %llu)\n", (unsigned long long)now); return 0; }
+        if (now != before) { printf("device reset by audiophileusbd (method %d, generation %llu)\n", method, (unsigned long long)now); return 0; }
     }
     fprintf(stderr, "no answer from audiophileusbd within 5 s (is it installed/running?)\n");
     return 1;
@@ -642,7 +657,10 @@ static int cmd_hal_list(void)
 typedef struct {
     double      rate, phase, step;
     float       amp;
-    bool        loopback;
+    bool        loopback, sweep;
+    int         channel;
+    double      sweepT;
+    uint8_t    *rec; size_t recCap, recLen;   /* --out: per-cycle input+output dump */
     _Atomic uint64_t cycles;
     _Atomic uint32_t overloads;
     float       inPeak;
@@ -668,7 +686,7 @@ static OSStatus hal_ioproc(AudioObjectID dev, const AudioTimeStamp *now, const A
         for (UInt32 i = 0; i < n; i++) {
             float v = fabsf(x[i * ch]);
             if (v > c->inPeak) c->inPeak = v;
-            if (c->loopback && c->waiting && v > 0.05f) {
+            if (c->loopback && c->waiting && v > 0.3f * c->amp) {
                 double rt = inTime->mSampleTime + i - c->lastPulseOut;
                 if (rt > 0 && rt < c->rate) {
                     c->rtSum += rt; c->rtCount++;
@@ -692,10 +710,27 @@ static OSStatus hal_ioproc(AudioObjectID dev, const AudioTimeStamp *now, const A
                 }
             } else {
                 v = (float)(c->amp * sin(c->phase));
-                c->phase += c->step;
+                if (c->sweep) {   /* exponential sweep 50 Hz -> 15 kHz, 1 octave per ~0.36 s, repeating */
+                    double f = 50.0 * pow(2.0, fmod(c->sweepT, 3.0) * 8.23 / 3.0);
+                    c->sweepT += 1.0 / c->rate;
+                    c->phase += 2 * M_PI * f / c->rate;
+                } else c->phase += c->step;
                 if (c->phase > 2 * M_PI) c->phase -= 2 * M_PI;
             }
-            for (UInt32 k = 0; k < ch; k++) y[i * ch + k] = v;
+            for (UInt32 k = 0; k < ch; k++) y[i * ch + k] = (c->channel < 0 || (int)k == c->channel) ? v : 0.0f;
+        }
+    }
+    if (c->rec && in && out && in->mNumberBuffers > 0 && out->mNumberBuffers > 0 && in->mBuffers[0].mData && out->mBuffers[0].mData &&
+        in->mBuffers[0].mDataByteSize == out->mBuffers[0].mDataByteSize) {
+        uint32_t bytes = in->mBuffers[0].mDataByteSize;
+        size_t need = 24 + 2 * (size_t)bytes;
+        if (c->recLen + need <= c->recCap) {
+            uint8_t *p = c->rec + c->recLen;
+            double ti = inTime->mSampleTime, to = outTime->mSampleTime;
+            uint32_t chn = in->mBuffers[0].mNumberChannels;
+            memcpy(p, &ti, 8); memcpy(p + 8, &to, 8); memcpy(p + 16, &bytes, 4); memcpy(p + 20, &chn, 4);
+            memcpy(p + 24, in->mBuffers[0].mData, bytes); memcpy(p + 24 + bytes, out->mBuffers[0].mData, bytes);
+            c->recLen += need;
         }
     }
     uint64_t dt = mach_absolute_time() - t0;
@@ -722,7 +757,8 @@ static AudioObjectID device_by_uid(const char *uidStr)
     return dev;
 }
 
-static int cmd_hal_test(const char *uid, unsigned buffer, double seconds, bool loopback, double level, double reqRate)
+static int cmd_hal_test(const char *uid, unsigned buffer, double seconds, bool loopback, double level, double reqRate,
+                        int channel, bool sweep, const char *outPath)
 {
     AudioObjectID dev = device_by_uid(uid ? uid : kDeviceUID);
     if (dev == kAudioObjectUnknown) { fprintf(stderr, "Core Audio device '%s' not found\n", uid ? uid : kDeviceUID); return 1; }
@@ -743,6 +779,8 @@ static int cmd_hal_test(const char *uid, unsigned buffer, double seconds, bool l
     c.step = 2 * M_PI * 1000.0 / c.rate;
     c.amp = (float)pow(10.0, level / 20.0);
     c.loopback = loopback;
+    c.channel = channel; c.sweep = sweep;
+    if (outPath) { c.recCap = (size_t)((seconds + 1.5) * c.rate * 2 * 4 * 2 * 1.2) + 1000000; c.rec = malloc(c.recCap); }
     c.nextPulseAt = -1;
     print_device(dev);
 
@@ -774,6 +812,11 @@ static int cmd_hal_test(const char *uid, unsigned buffer, double seconds, bool l
     if (cyc) printf("IOProc time avg %.1f us, max %.1f us; client process CPU %.1f%%\n",
                     (double)c.hostNanosSum * tb.numer / tb.denom / cyc / 1000.0,
                     (double)c.hostNanosMax * tb.numer / tb.denom / 1000.0, 100.0 * cpu / (seconds + 0.2));
+    if (c.rec) {
+        FILE *f = fopen(outPath, "wb");
+        if (f) { fwrite(c.rec, 1, c.recLen, f); fclose(f); printf("wrote %zu bytes of input+output cycles to %s\n", c.recLen, outPath); }
+        free(c.rec);
+    }
     if (loopback) {
         if (c.rtCount)
             printf("LOOPBACK round trip: avg %.1f frames (%.2f ms), min %.0f, max %.0f over %d pulses\n",
@@ -873,7 +916,7 @@ int main(int argc, char **argv)
     if (argc < 2) { usage(); return 2; }
     const char *cmd = argv[1];
     stream_opts o = { .mode = apusb_mode_default()->name, .seconds = 5.0,
-                      .buffer = 64, .level = -30.0, .xfers = APUSB_STREAM_DEFAULT_XFERS, .framesPerXfer = APUSB_STREAM_DEFAULT_FRAMES_PER_XFER };
+                      .buffer = 64, .level = -30.0, .channel = -1, .xfers = APUSB_STREAM_DEFAULT_XFERS, .framesPerXfer = APUSB_STREAM_DEFAULT_FRAMES_PER_XFER };
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
         const char *v = (i + 1 < argc) ? argv[i + 1] : NULL;
@@ -890,6 +933,9 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--buffer") && v) { o.buffer = (unsigned)atoi(v); i++; }
         else if (!strcmp(a, "--level") && v) { o.level = atof(v); i++; }
         else if (!strcmp(a, "--loopback")) o.loopback = true;
+        else if (!strcmp(a, "--sweep")) o.sweep = true;
+        else if (!strcmp(a, "--method") && v) { o.method = atoi(v); i++; }
+        else if (!strcmp(a, "--channel") && v) { o.channel = atoi(v); i++; }
         else if (!strcmp(a, "--capture")) o.capture = true;
         else if (!strcmp(a, "--xfers") && v) { o.xfers = (unsigned)atoi(v); i++; }
         else if (!strcmp(a, "--frames-per-xfer") && v) { o.framesPerXfer = (unsigned)atoi(v); i++; }
@@ -905,11 +951,11 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "midi-monitor")) return cmd_midi_monitor(o.seconds);
     if (!strcmp(cmd, "midi-test")) return cmd_midi_test();
     if (!strcmp(cmd, "get-mode")) return cmd_get_mode();
-    if (!strcmp(cmd, "reset")) return cmd_reset();
+    if (!strcmp(cmd, "reset")) return cmd_reset(o.method);
     if (!strcmp(cmd, "hal-list")) return cmd_hal_list();
     if (!strcmp(cmd, "coremidi-list")) return cmd_coremidi_list();
     if (!strcmp(cmd, "coremidi-test")) return cmd_coremidi_test(o.seconds);
-    if (!strcmp(cmd, "hal-test")) return cmd_hal_test(o.uid, o.buffer, o.seconds, o.loopback, o.level, o.rate);
+    if (!strcmp(cmd, "hal-test")) return cmd_hal_test(o.uid, o.buffer, o.seconds, o.loopback, o.level, o.rate, o.channel, o.sweep, o.out);
     if (!strcmp(cmd, "set-mode")) { if (argc < 3) { usage(); return 2; } return cmd_set_mode(argv[2]); }
     usage();
     return 2;

@@ -18,6 +18,8 @@
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOCFPlugIn.h>
 #include <IOKit/usb/IOUSBLib.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
+#include <IOKit/IOMessage.h>
 #include <dispatch/dispatch.h>
 #include <notify.h>
 #include <os/log.h>
@@ -54,6 +56,8 @@ static void release_device(void)
     drop();
 }
 
+static int  gLatchedKey = 0;   /* stream key the device latched since enumeration, 0 = fresh */
+
 static void capture(io_service_t s)
 {
     if (gDev) return;
@@ -70,35 +74,130 @@ static void capture(io_service_t s)
     if (kr) { drop(); return; }
     IOObjectRetain(s);
     gService = s;
+    gLatchedKey = 0;
 }
 
 static int gDoneToken = -1;
 static uint64_t gResetGeneration = 0;
 
-/* Re-enumerate the (captured) device: a USB reset returns the firmware to a
- * clean state. Capturing again re-enumerates without ever letting
- * AppleUSBAudio attach in between. */
-static void reset_device(void)
+static int gReqToken = -1;
+static int gDefaultMethod = APUSB_RESET_RELEASE;
+static bool gWaitingRecapture = false;
+
+static bool has_apple_audio(io_registry_entry_t e, int depth)
 {
-    IOReturn kr = kIOReturnNoDevice;
-    if (gDev) {
-        kr = (*gDev)->USBDeviceReEnumerate(gDev, kUSBReEnumerateCaptureDeviceMask);
-        if (kr != kIOReturnSuccess) {
-            /* fall back: hand back and take again */
-            io_service_t s = gService; if (s) IOObjectRetain(s);
-            release_device();
-            usleep(1500 * 1000);
-            io_service_t now = apusb_find_service(APUSB_VENDOR_ID, APUSB_PRODUCT_ID);
-            if (now) { capture(now); IOObjectRelease(now); kr = gDev ? kIOReturnSuccess : kIOReturnError; }
-            if (s) IOObjectRelease(s);
-        }
+    if (depth > 4) return false;
+    io_iterator_t it = 0; bool found = false;
+    if (IORegistryEntryGetChildIterator(e, kIOServicePlane, &it) != KERN_SUCCESS) return false;
+    io_registry_entry_t c;
+    while (!found && (c = IOIteratorNext(it)) != 0) {
+        io_name_t cls;
+        if (IOObjectGetClass(c, cls) == KERN_SUCCESS && strncmp(cls, "AppleUSBAudio", 13) == 0) found = true;
+        else found = has_apple_audio(c, depth + 1);
+        IOObjectRelease(c);
     }
+    IOObjectRelease(it);
+    return found;
+}
+
+static void reset_done(IOReturn kr, int method)
+{
     usleep(800 * 1000); /* interfaces re-published */
-    LOGI("audiophileusbd: device reset (re-enumerate): 0x%08x", kr);
-    fprintf(stderr, "audiophileusbd: reset: %s\n", apusb_strerror(kr));
+    LOGI("audiophileusbd: device reset (method %d): 0x%08x", method, kr);
+    fprintf(stderr, "audiophileusbd: reset (method %d): %s\n", method, apusb_strerror(kr));
     gResetGeneration = (gResetGeneration + 1) | ((uint64_t)(kr == kIOReturnSuccess ? 0 : 1) << 63);
     notify_set_state(gDoneToken, gResetGeneration & ~(1ULL << 63));
     notify_post(APUSB_NOTIFY_RESET_DONE);
+}
+
+/* Hardware finding: the Audiophile USB keeps the sample format (16/24-bit) of
+ * the first stream after it was enumerated by macOS; ReEnumerate(capture) on
+ * an already captured device does not clear that. Several reset methods are
+ * implemented so they can be compared on the hardware (apusb-diag reset --method N). */
+static void reset_device(uint64_t state)
+{
+    int method = (int)(state & 0xff), key = (int)((state >> 8) & 0xff);
+    if (key && method == APUSB_RESET_DEFAULT && gDev && (gLatchedKey == 0 || gLatchedKey == key)) {
+        gLatchedKey = key;      /* fresh device, or already in this format: nothing to do */
+        LOGI("audiophileusbd: stream key 0x%02x, no reset needed", key);
+        gResetGeneration++;
+        notify_set_state(gDoneToken, gResetGeneration);
+        notify_post(APUSB_NOTIFY_RESET_DONE);
+        return;
+    }
+    if (method == APUSB_RESET_DEFAULT) method = gDefaultMethod;
+    IOReturn kr = kIOReturnNoDevice;
+    if (!gDev) { reset_done(kr, method); return; }
+    switch (method) {
+    case APUSB_RESET_RECAPTURE:
+        kr = (*gDev)->USBDeviceReEnumerate(gDev, kUSBReEnumerateCaptureDeviceMask);
+        break;
+    case APUSB_RESET_SETCONFIG:
+    case APUSB_RESET_PORTRESET:
+        kr = (*gDev)->USBDeviceOpenSeize(gDev);
+        if (kr == kIOReturnSuccess) {
+            if (method == APUSB_RESET_SETCONFIG) {
+                kr = (*gDev)->SetConfiguration(gDev, 0);
+                usleep(200 * 1000);
+                IOReturn k2 = (*gDev)->SetConfiguration(gDev, 1);
+                if (!kr) kr = k2;
+            } else {
+                kr = (*gDev)->ResetDevice(gDev);
+                usleep(200 * 1000);
+                IOReturn k2 = (*gDev)->SetConfiguration(gDev, 1);
+                LOGI("audiophileusbd: set configuration after port reset: 0x%08x", k2);
+            }
+            (*gDev)->USBDeviceClose(gDev);
+        }
+        break;
+    case APUSB_RESET_RELEASE:
+    default:
+        /* the device is re-enumerated by macOS; on_added() captures the new one */
+        gWaitingRecapture = true;
+        uint64_t oldId = 0;
+        if (gService) IORegistryEntryGetRegistryEntryID(gService, &oldId);
+        release_device();
+        for (int i = 0; i < 80 && gDev == NULL; i++) {
+            /* on_added runs on this serial queue; poll the registry for the new device */
+            usleep(100 * 1000);
+            io_service_t s = apusb_find_service(APUSB_VENDOR_ID, APUSB_PRODUCT_ID);
+            uint64_t id = 0;
+            if (s) IORegistryEntryGetRegistryEntryID(s, &id);
+            if (s && id != oldId) {
+                /* let macOS finish attaching AppleUSBAudio before taking the device
+                 * away again (capturing mid-attach once stalled for minutes) */
+                for (int k = 0; k < 30 && !has_apple_audio(s, 0); k++) usleep(100 * 1000);
+                usleep(700 * 1000);
+                capture(s);
+            }
+            if (s) IOObjectRelease(s);
+        }
+        gWaitingRecapture = false;
+        kr = gDev ? kIOReturnSuccess : kIOReturnNoDevice;
+        break;
+    }
+    if (method == APUSB_RESET_RELEASE) gLatchedKey = key;   /* fresh enumeration, then this stream */
+    reset_done(kr, method);
+}
+
+/* After system sleep the device's state is unknown (measured: 24-bit capture was
+ * garbage after a wake although 24-bit was latched before). Force a real
+ * re-enumeration before the next stream. */
+static io_connect_t gRootPort = 0;
+static void on_power(void *refcon, io_service_t service, natural_t type, void *arg)
+{
+    (void)refcon; (void)service;
+    switch (type) {
+    case kIOMessageCanSystemSleep:
+    case kIOMessageSystemWillSleep:
+        IOAllowPowerChange(gRootPort, (long)arg);
+        break;
+    case kIOMessageSystemHasPoweredOn:
+        gLatchedKey = 0xff;   /* unknown: never matches a real key */
+        LOGI("audiophileusbd: system woke up; device will be re-enumerated before the next stream");
+        break;
+    default: break;
+    }
 }
 
 static void on_added(void *refcon, io_iterator_t it)
@@ -139,9 +238,17 @@ int main(int argc, char **argv)
     IOServiceAddMatchingNotification(port, kIOTerminatedNotification, apusb_matching(APUSB_VENDOR_ID, APUSB_PRODUCT_ID), on_removed, NULL, &removed);
     dispatch_sync(gQueue, ^{ on_added(NULL, added); io_service_t s; while ((s = IOIteratorNext(removed))) IOObjectRelease(s); });
 
+    IONotificationPortRef pwrPort = NULL; io_object_t pwrNotifier = 0;
+    gRootPort = IORegisterForSystemPower(NULL, &pwrPort, on_power, &pwrNotifier);
+    if (gRootPort && pwrPort) IONotificationPortSetDispatchQueue(pwrPort, gQueue);
+
     notify_register_check(APUSB_NOTIFY_RESET_DONE, &gDoneToken);
     int reqToken = -1;
-    notify_register_dispatch(APUSB_NOTIFY_RESET_REQUEST, &reqToken, gQueue, ^(int t) { (void)t; reset_device(); });
+    notify_register_dispatch(APUSB_NOTIFY_RESET_REQUEST, &reqToken, gQueue, ^(int t) {
+        uint64_t m = 0; notify_get_state(t, &m); notify_set_state(t, 0);
+        reset_device(m);
+    });
+    gReqToken = reqToken;
 
     int sigs[] = { SIGTERM, SIGINT, SIGHUP };
     for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {

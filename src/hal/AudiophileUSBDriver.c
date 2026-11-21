@@ -57,12 +57,17 @@ enum {
 /* Low-latency USB scheduling: kXfers transfers of kFramesPerXfer 1-ms USB frames. */
 #define kXfers               APUSB_STREAM_DEFAULT_XFERS
 #define kFramesPerXfer       APUSB_STREAM_DEFAULT_FRAMES_PER_XFER
-/* Output: the USB thread reads up to one transfer ahead of "now" -> cover it + 1 ms jitter. */
+/* Output: reads are kept behind "now" (kReadLagMs); keep a small safety margin for jitter. */
 #define kSafetyOffsetOutMs   (kFramesPerXfer + 1u)
 /* Input: data arrives once per transfer -> cover one transfer + 1 ms jitter. */
 #define kSafetyOffsetInMs    (kFramesPerXfer + 1u)
 #define kCorrectionToleranceMs 2u
 #define kResyncThresholdMs   100u
+/* Output read position target: the USB side reads samples kReadLagMs behind
+ * "now" (on average) so it never reads past what Core Audio has written
+ * (Core Audio only guarantees data up to now + safety offset). The samples are
+ * then heard ~ (in-flight queue + lag) later, which is reported as latency. */
+#define kReadLagMs           2u
 
 /* Custom property: current mode name (CFString), settable. */
 #define kAudiophilePropertyMode  'apmd'
@@ -105,8 +110,27 @@ static int64_t         gOutReadPos = 0, gInWritePos = 0;
 static bool            gInSynced = false;
 static float           gLastInFrame[kChannels];
 static float           gInPeak = 0;
+/* Diagnostics (logged when IO stops): output underruns = frames the USB side
+ * read before Core Audio had written them; corrections; and a 1 kHz-tone
+ * integrity check computed on the exact bytes sent over USB (decoded back). */
+static _Atomic int64_t gOutWriteHi = INT64_MIN;
+static uint64_t gStartupSilence, gUnderrunFrames, gUnderrunEvents, gCorrUp, gCorrDown, gFilledFrames;
+static int64_t  gWriteLeadMin = INT64_MAX, gWriteLeadMax = INT64_MIN, gReadLeadMin = INT64_MAX, gReadLeadMax = INT64_MIN;
+static uint64_t gWireRNonZero, gWireClicks; static double gToneResEma;
+static double   gToneSig, gToneRes, gToneX1, gToneX2, gToneW; static uint64_t gToneN;
 static float           gScratchOut[256 * kChannels];
 static float           gScratchIn[256 * kChannels];
+/* Input diagnostics on the raw USB capture (decoded), and loopback pulse timing
+ * in HAL sample time (output pulse time = ring read position when sent). */
+static double   gInSq[kChannels], gInRes[kChannels], gInX1[kChannels], gInX2[kChannels];
+static uint64_t gInFrames, gInZc, gInZcFirst, gInZcLast; static bool gInPos;
+static double gInResEma; static uint64_t gInClicks, gInRepeat, gInDrop, gInPktHist[4];
+static uint64_t gRExcFrames, gRExcEvents, gRExcLast; static bool gRExcLoggedThis;
+static const uint8_t *gCurPacket; static unsigned gCurPacketBytes, gCurPacketFrames, gCurFrameInPacket;
+static int64_t  gOutPulseT[64], gInPulseT[64]; static unsigned gOutPulses, gInPulses;
+static int64_t  gOutLastPulse = INT64_MIN / 2, gInLastPulse = INT64_MIN / 2;
+static float           gScratchMix[256 * kChannels], gScratchRd[256 * kChannels];
+static bool            gLoggedWriteBytes = false, gLoggedInBytes = false;
 
 /* Hot-plug */
 static IONotificationPortRef gNotifyPort = NULL;
@@ -229,16 +253,33 @@ static const apusb_mode *mode_for(UInt32 bits, Float64 rate, int dir)
 /* ------------------------------------------------------------------------ */
 #pragma mark USB streaming callbacks
 
+static double   gErrAvg = 0;
+static uint64_t gPktCount = 0;
+
 static unsigned play_packet_frames(void *ctx)
 {
     (void)ctx;
-    int64_t err = host_now_sample() - gOutReadPos;
-    int64_t tol = ms_frames(kCorrectionToleranceMs);
+    int64_t target = host_now_sample() - (int64_t)ms_frames(kReadLagMs);
+    int64_t err = target - gOutReadPos;
     if (err > (int64_t)ms_frames(kResyncThresholdMs) || err < -(int64_t)ms_frames(kResyncThresholdMs)) {
-        gOutReadPos = host_now_sample();
-        err = 0;
+        gOutReadPos = target;
+        err = 0; gErrAvg = 0;
     }
-    int corr = err > tol ? 1 : (err < -tol ? -1 : 0);
+    /* Packets are filled in batches (one transfer = several 1-ms packets at
+     * once), so the instantaneous error saw-tooths; correct on a smoothed error
+     * and only after the initial queue has been filled. */
+    gErrAvg += ((double)err - gErrAvg) / 32.0;
+    int corr = 0;
+    if (gPktCount == (uint64_t)(2 * kXfers * kFramesPerXfer) && (err > (int64_t)ms_frames(1) || err < -(int64_t)ms_frames(1))) {
+        /* still in the (silent) start-up phase: re-anchor instead of slewing; at
+         * 48 kHz/16-bit the packet size limit (48 frames) leaves no room to catch up */
+        gOutReadPos = target; err = 0;
+    }
+    if (++gPktCount > (uint64_t)(2 * kXfers * kFramesPerXfer)) {
+        double tol = (double)ms_frames(1);
+        corr = gErrAvg > tol ? 1 : (gErrAvg < -tol ? -1 : 0);
+    } else gErrAvg = 0;
+    if (corr > 0) gCorrUp++; else if (corr < 0) gCorrDown++;
     return apusb_pacer_next(&gPacer, corr);
 }
 
@@ -247,8 +288,37 @@ static void play_fill(void *ctx, uint8_t *dst, unsigned frames)
     (void)ctx;
     while (frames > 0) {
         unsigned n = frames > 256 ? 256 : frames;
+        int64_t hi = atomic_load_explicit(&gOutWriteHi, memory_order_acquire);
+        { int64_t rl = gOutReadPos - host_now_sample(); if (gFilledFrames > 4000) { if (rl < gReadLeadMin) gReadLeadMin = rl; if (rl > gReadLeadMax) gReadLeadMax = rl; } }
+        if (hi == INT64_MIN) gStartupSilence += n;      /* Core Audio has not written yet */
+        else if (gOutReadPos + (int64_t)n > hi) {
+            int64_t missing = gOutReadPos + (int64_t)n - (hi > gOutReadPos ? hi : gOutReadPos);
+            gUnderrunFrames += (uint64_t)missing; gUnderrunEvents++;
+        }
         apusb_ring_read(&gOutRing, gOutReadPos, gScratchOut, n, true);
         apusb_float_to_pcm(gScratchOut, dst, n, kChannels, gMode->format);
+        {   /* decode what we just put on the wire and test it against a pure sine predictor */
+            float chk[256 * kChannels];
+            apusb_pcm_to_float(dst, chk, n, kChannels, gMode->format);
+            double c = 2.0 * cos(gToneW);
+            for (unsigned k = 0; k < n; k++) {
+                double x = chk[k * kChannels];
+                if (chk[k * kChannels + 1] != 0.0f) gWireRNonZero++;
+                if (gToneN >= 2) {
+                    double r = x - c * gToneX1 + gToneX2; gToneRes += r * r; gToneSig += x * x;
+                    if (gToneN > (uint64_t)gSampleRate && gToneResEma > 0 && r * r > 50.0 * gToneResEma && r * r > 1e-12) gWireClicks++;
+                    gToneResEma += (r * r - gToneResEma) * (1.0 / 2048.0);
+                }
+                gToneX2 = gToneX1; gToneX1 = x; gToneN++;
+                /* isolated pulse (loopback test): a sample >= 0.003 after >=100 ms of near silence */
+                int64_t tt = gOutReadPos + (int64_t)k;
+                if (fabs(x) >= 0.003 && tt - gOutLastPulse > (int64_t)(gSampleRate / 10) && fabs(gToneX2) < 0.0005) {
+                    if (gOutPulses < 64) gOutPulseT[gOutPulses++] = tt;
+                    gOutLastPulse = tt;
+                }
+            }
+            gFilledFrames += n;
+        }
         dst += (size_t)n * kChannels * apusb_format_bytes(gMode->format);
         gOutReadPos += n;
         frames -= n;
@@ -258,6 +328,12 @@ static void play_fill(void *ctx, uint8_t *dst, unsigned frames)
 static void cap_consume(void *ctx, const uint8_t *src, unsigned frames)
 {
     (void)ctx;
+    {
+        unsigned nom = (unsigned)(gSampleRate / 1000.0);
+        gInPktHist[frames == 0 ? 0 : frames + 1 < nom ? 1 : frames > nom + 1 ? 3 : 2]++;
+    }
+    gCurPacket = src; gCurPacketFrames = frames; gCurPacketBytes = frames * kChannels * apusb_format_bytes(gMode->format);
+    gCurFrameInPacket = 0;
     int64_t now = host_now_sample();
     if (!gInSynced || llabs(now - gInWritePos) > (long long)ms_frames(kResyncThresholdMs)) {
         gInWritePos = now;
@@ -268,16 +344,68 @@ static void cap_consume(void *ctx, const uint8_t *src, unsigned frames)
     if (now - gInWritePos > tol) {
         /* device slower than host clock: repeat one frame */
         apusb_ring_write(&gInRing, gInWritePos++, gLastInFrame, 1);
+        gInRepeat++;
     } else if (gInWritePos - now > tol && frames > 0) {
         /* device faster: drop one frame */
         src += bpf;
         frames--;
+        gInDrop++;
+    }
+    if (!gLoggedInBytes && gInFrames > (uint64_t)gSampleRate && frames >= 12) {
+        gLoggedInBytes = true;
+        char hex[3 * 72 + 1]; unsigned nb = frames * bpf < 72 ? frames * bpf : 72;
+        for (unsigned k = 0; k < nb; k++) snprintf(hex + 3 * k, 4, "%02x ", src[k]);
+        LOG("AudiophileUSB: capture raw bytes (%u frames x %u bytes in this packet): %{public}s", frames, bpf, hex);
     }
     while (frames > 0) {
         unsigned n = frames > 256 ? 256 : frames;
         apusb_pcm_to_float(src, gScratchIn, n, kChannels, gMode->format);
         for (unsigned k = 0; k < n * kChannels; k++) { float v = fabsf(gScratchIn[k]); if (v > gInPeak) gInPeak = v; }
+        {
+            double c = 2.0 * cos(gToneW);
+            for (unsigned k = 0; k < n; k++) {
+                for (unsigned ch = 0; ch < kChannels; ch++) {
+                    double x = gScratchIn[k * kChannels + ch];
+                    if (gInFrames >= 2) {
+                        double r = x - c * gInX1[ch] + gInX2[ch]; gInRes[ch] += r * r; gInSq[ch] += x * x;
+                        if (ch == 0) {  /* click / discontinuity detector on L (after 1 s warm-up) */
+                            if (gInFrames > (uint64_t)gSampleRate && r * r > 50.0 * gInResEma && gInResEma > 0) gInClicks++;
+                            gInResEma += (r * r - gInResEma) * (1.0 / 2048.0);
+                        }
+                    }
+                    gInX2[ch] = gInX1[ch]; gInX1[ch] = x;
+                }
+                double x0 = gScratchIn[k * kChannels];
+                {   /* channel-integrity probe for "tone on L only" tests: R excursions */
+                    double r1 = fabs(gScratchIn[k * kChannels + 1]);
+                    if (r1 > 0.0005) {
+                        if (gInFrames - gRExcLast > 1) gRExcEvents++;
+                        gRExcLast = gInFrames; gRExcFrames++;
+                        if (gRExcEvents <= 4 && !gRExcLoggedThis) {
+                            gRExcLoggedThis = true;
+                            unsigned bpf1 = kChannels * apusb_format_bytes(gMode->format);
+                            unsigned fi = gCurFrameInPacket + k, f0 = fi >= 2 ? fi - 2 : 0;
+                            unsigned b0 = f0 * bpf1, nb = gCurPacketBytes > b0 ? gCurPacketBytes - b0 : 0;
+                            if (nb > 8 * bpf1) nb = 8 * bpf1;
+                            char hex[3 * 64 + 1]; hex[0] = 0;
+                            for (unsigned q = 0; q < nb && q < 64; q++) snprintf(hex + 3 * q, 4, "%02x ", gCurPacket[b0 + q]);
+                            LOG("AudiophileUSB: R excursion at input frame %llu (frame %u of %u in packet), bytes from frame %u: %{public}s",
+                                (unsigned long long)gInFrames, fi, gCurPacketFrames, f0, hex);
+                        }
+                    } else gRExcLoggedThis = false;
+                }
+                if (!gInPos && x0 > 0.0002) { gInPos = true; gInZc++; if (gInZc == 1) gInZcFirst = gInFrames; gInZcLast = gInFrames; } else if (gInPos && x0 < -0.0002) gInPos = false;
+                int64_t tt = gInWritePos + (int64_t)k;
+                double a = fabs(x0) > fabs(gScratchIn[k * kChannels + 1]) ? fabs(x0) : fabs(gScratchIn[k * kChannels + 1]);
+                if (a >= 0.0003 && tt - gInLastPulse > (int64_t)(gSampleRate / 10)) {
+                    if (gInPulses < 64) gInPulseT[gInPulses++] = tt;
+                    gInLastPulse = tt;
+                }
+                gInFrames++;
+            }
+        }
         apusb_ring_write(&gInRing, gInWritePos, gScratchIn, n);
+        gCurFrameInPacket += n;
         memcpy(gLastInFrame, gScratchIn + (size_t)(n - 1) * kChannels, sizeof gLastInFrame);
         gInWritePos += n;
         src += (size_t)n * bpf;
@@ -294,6 +422,56 @@ static void stream_status(void *ctx, IOReturn r, const char *what)
 /* ------------------------------------------------------------------------ */
 #pragma mark USB open / close
 
+static void log_output_diag(void)
+{
+    double snr = gToneRes > 0 ? 10.0 * log10(gToneSig / gToneRes) : 999.0;
+    LOG("AudiophileUSB: output diag: %llu frames sent (%llu silent before first write), underruns %llu frames in %llu events, "
+        "corrections +%llu/-%llu, 1kHz-tone wire SNR %d dB (pure sine ~>60, glitches lower)",
+        (unsigned long long)gFilledFrames, (unsigned long long)gStartupSilence, (unsigned long long)gUnderrunFrames, (unsigned long long)gUnderrunEvents,
+        (unsigned long long)gCorrUp, (unsigned long long)gCorrDown, (int)snr);
+    LOG("AudiophileUSB: wire right-channel non-zero frames: %llu (0 expected for left-only test tones)", (unsigned long long)gWireRNonZero);
+    LOG("AudiophileUSB: wire L clicks/discontinuities: %llu", (unsigned long long)gWireClicks);
+    gWireRNonZero = 0; gWireClicks = 0; gToneResEma = 0;
+    LOG("AudiophileUSB: timing (frames rel. to now): Core Audio writes from %lld..%lld ahead; USB reads at %lld..%lld (after first 4000 frames)",
+        (long long)gWriteLeadMin, (long long)gWriteLeadMax, (long long)gReadLeadMin, (long long)gReadLeadMax);
+    gWriteLeadMin = gReadLeadMin = INT64_MAX; gWriteLeadMax = gReadLeadMax = INT64_MIN;
+    gStartupSilence = gUnderrunFrames = gUnderrunEvents = gCorrUp = gCorrDown = gFilledFrames = 0;
+    gToneSig = gToneRes = gToneX1 = gToneX2 = 0; gToneN = 0;
+    gLoggedWriteBytes = false;
+}
+
+static void log_input_diag(void)
+{
+    double rmsL = gInFrames ? 10 * log10(gInSq[0] / gInFrames + 1e-30) : -300, rmsR = gInFrames ? 10 * log10(gInSq[1] / gInFrames + 1e-30) : -300;
+    double snrL = gInRes[0] > 0 ? 10 * log10(gInSq[0] / gInRes[0]) : 0, snrR = gInRes[1] > 0 ? 10 * log10(gInSq[1] / gInRes[1]) : 0;
+    LOG("AudiophileUSB: input diag (raw USB): %llu frames, RMS L %.1f / R %.1f dBFS, 1kHz-predictor SNR L %.1f / R %.1f dB, "
+        "ch0 tone frequency (zero crossings) %.2f Hz", (unsigned long long)gInFrames, rmsL, rmsR, snrL, snrR, (gInZc > 10 && gInZcLast > gInZcFirst) ? (double)(gInZc - 1) * gSampleRate / (double)(gInZcLast - gInZcFirst) : 0.0);
+    LOG("AudiophileUSB: input L clicks/discontinuities (residual > 17 dB above its running mean): %llu", (unsigned long long)gInClicks);
+    LOG("AudiophileUSB: input clock corrections: %llu repeated, %llu dropped frames; packets: %llu empty, %llu short, %llu normal, %llu long",
+        (unsigned long long)gInRepeat, (unsigned long long)gInDrop, (unsigned long long)gInPktHist[0], (unsigned long long)gInPktHist[1],
+        (unsigned long long)gInPktHist[2], (unsigned long long)gInPktHist[3]);
+    gInClicks = 0; gInResEma = 0; gInRepeat = gInDrop = 0; memset(gInPktHist, 0, sizeof gInPktHist);
+    LOG("AudiophileUSB: input R-channel excursions (> -66 dBFS): %llu frames in %llu events",
+        (unsigned long long)gRExcFrames, (unsigned long long)gRExcEvents);
+    gRExcFrames = gRExcEvents = 0; gRExcLast = 0; gRExcLoggedThis = false;
+    /* pair each output pulse with the first input pulse after it */
+    double sum = 0; int64_t mn = INT64_MAX, mx = INT64_MIN; unsigned cnt = 0, j = 0;
+    for (unsigned i = 0; i < gOutPulses; i++) {
+        while (j < gInPulses && gInPulseT[j] <= gOutPulseT[i]) j++;
+        if (j < gInPulses) {
+            int64_t d = gInPulseT[j] - gOutPulseT[i];
+            if (d < (int64_t)(gSampleRate / 10)) { sum += d; cnt++; if (d < mn) mn = d; if (d > mx) mx = d; }
+        }
+    }
+    if (gOutPulses || gInPulses)
+        LOG("AudiophileUSB: loopback pulses: %u out, %u in; matched %u, round trip (HAL sample time) avg %.1f frames = %.2f ms, min %lld, max %lld",
+            gOutPulses, gInPulses, cnt, cnt ? sum / cnt : 0.0, cnt ? 1000.0 * sum / cnt / gSampleRate : 0.0,
+            (long long)(cnt ? mn : 0), (long long)(cnt ? mx : 0));
+    memset(gInSq, 0, sizeof gInSq); memset(gInRes, 0, sizeof gInRes); memset(gInX1, 0, sizeof gInX1); memset(gInX2, 0, sizeof gInX2);
+    gInFrames = gInZc = 0; gInPos = false; gLoggedInBytes = false; gOutPulses = gInPulses = 0;
+    gOutLastPulse = gInLastPulse = INT64_MIN / 2;
+}
+
 static void log_stream_stats(apusb_stream *st, const char *what)
 {
     uint64_t pk = 0, er = 0, rs = 0;
@@ -308,12 +486,20 @@ static void log_stream_stats(apusb_stream *st, const char *what)
  * configuration differs from the one used since the last reset, ask
  * audiophileusbd (root) to re-enumerate the device first (~1-2 s). */
 static _Atomic bool gResetting = false;
-static double gLastConfigKey = -1;
 
-static bool request_device_reset(void)
+/* Ask audiophileusbd to make sure the device is in a clean state for this
+ * stream key (bit depth, | 0x80 for 96 kHz modes). Hardware finding: the
+ * device keeps the sample format of the first stream after enumeration; the
+ * daemon re-enumerates it (hand back to macOS + capture again, ~3 s) only if
+ * it already streamed in a different format. */
+static bool request_device_reset(int key)
 {
-    int tok = -1;
+    int tok = -1, rt = -1;
     uint64_t before = 0, now = 0;
+    if (notify_register_check(APUSB_NOTIFY_RESET_REQUEST, &rt) == NOTIFY_STATUS_OK) {
+        notify_set_state(rt, APUSB_RESET_STATE(APUSB_RESET_DEFAULT, key));
+        notify_cancel(rt);
+    }
     if (notify_register_check(APUSB_NOTIFY_RESET_DONE, &tok) != NOTIFY_STATUS_OK) {
         LOGE("AudiophileUSB: notify unavailable, cannot reset device");
         return false;
@@ -322,7 +508,7 @@ static bool request_device_reset(void)
     atomic_store(&gResetting, true);
     notify_post(APUSB_NOTIFY_RESET_REQUEST);
     bool ok = false;
-    for (int i = 0; i < 100 && !ok; i++) {          /* <= 5 s */
+    for (int i = 0; i < 200 && !ok; i++) {          /* <= 10 s */
         usleep(50 * 1000);
         notify_get_state(tok, &now);
         ok = now != before;
@@ -334,9 +520,10 @@ static bool request_device_reset(void)
 
 static void usb_close(void)
 {
-    if (gPlayStream) { apusb_stream_stop(gPlayStream); log_stream_stats(gPlayStream, "playback"); apusb_stream_destroy(gPlayStream); gPlayStream = NULL; }
+    if (gPlayStream) { apusb_stream_stop(gPlayStream); log_stream_stats(gPlayStream, "playback"); log_output_diag(); apusb_stream_destroy(gPlayStream); gPlayStream = NULL; }
     if (gCapStream)  { apusb_stream_stop(gCapStream); log_stream_stats(gCapStream, "capture");
                        LOG("AudiophileUSB: capture peak %d dBFS (x10)", gInPeak > 0 ? (int)(200.0 * log10(gInPeak)) : -2000);
+                       log_input_diag();
                        gInPeak = 0; apusb_stream_destroy(gCapStream);  gCapStream = NULL; }
     for (int i = APUSB_IF_STREAM_FIRST; i <= APUSB_IF_STREAM_LAST; i++) {
         if (gIntf[i].intf) {
@@ -349,10 +536,8 @@ static void usb_close(void)
 
 static OSStatus usb_open_and_start(void)
 {
-    double key = (double)(gMode - apusb_mode_at(0)) * 1.0e6 + gSampleRate;
-    if (key != gLastConfigKey) {
-        if (request_device_reset()) gLastConfigKey = key;
-    }
+    int key = (int)mode_bits(gMode) | (gMode->defaultRate > 48000.0 ? 0x80 : 0);
+    if (!request_device_reset(key)) LOGE("AudiophileUSB: no answer from audiophileusbd; audio may be distorted if the bit depth changed");
     io_service_t svc = apusb_find_service(APUSB_VENDOR_ID, APUSB_PRODUCT_ID);
     atomic_store(&gResetting, false);
     if (!svc) { LOGE("AudiophileUSB: device not found"); return kAudioHardwareBadDeviceError; }
@@ -387,13 +572,20 @@ static OSStatus usb_open_and_start(void)
         kr = apusb_set_sample_rate(it, pipe.address, (UInt32)gSampleRate);
         if (kr) LOGE("AudiophileUSB: set rate (out) %{public}s", apusb_strerror(kr));
         apusb_pacer_init(&gPacer, (uint32_t)gSampleRate);
-        gOutReadPos = host_now_sample();
+        gToneW = 2.0 * M_PI * 1000.0 / gSampleRate;
+        atomic_store(&gOutWriteHi, INT64_MIN);
+        /* The first kXfers transfers are filled immediately but play over the next
+         * kXfers*kFramesPerXfer ms: start reading that far (plus the lag) in the past. */
+        gOutReadPos = host_now_sample() - (int64_t)ms_frames(kReadLagMs + kXfers * kFramesPerXfer);
+        gErrAvg = 0; gPktCount = 0;
         cb.packet_frames = play_packet_frames;
         cb.fill = play_fill;
         cb.consume = NULL;
         cb.ctx = NULL;
         gPlayStream = apusb_stream_create(it, &pipe, false, bpf, kXfers, kFramesPerXfer, &cb);
         if (gPlayStream == NULL) goto fail;
+        /* re-anchor right before the initial fill (interface setup takes a few ms) */
+        gOutReadPos = host_now_sample() - (int64_t)ms_frames(kReadLagMs + kXfers * kFramesPerXfer);
         if ((kr = apusb_stream_start(gPlayStream))) goto fail_kr;
     }
     if (mode_has_input()) {
@@ -405,6 +597,7 @@ static OSStatus usb_open_and_start(void)
         kr = apusb_set_sample_rate(it, pipe.address, (UInt32)gSampleRate);
         if (kr) LOGE("AudiophileUSB: set rate (in) %{public}s", apusb_strerror(kr));
         gInSynced = false;
+        gToneW = 2.0 * M_PI * 1000.0 / gSampleRate;
         cb.packet_frames = NULL;
         cb.fill = NULL;
         cb.consume = cap_consume;
@@ -853,7 +1046,7 @@ static OSStatus APUSB_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectI
         case kAudioDevicePropertyLatency:
             NEED(sizeof(UInt32));
             /* output: data queued in in-flight USB transfers; input: one transfer */
-            *(UInt32 *)out = (a->mScope == kAudioObjectPropertyScopeOutput) ? ms_frames((kXfers - 1) * kFramesPerXfer) : ms_frames(kFramesPerXfer);
+            *(UInt32 *)out = (a->mScope == kAudioObjectPropertyScopeOutput) ? ms_frames(kXfers * kFramesPerXfer + kReadLagMs) : ms_frames(kFramesPerXfer);
             break;
         case kAudioDevicePropertySafetyOffset:
             NEED(sizeof(UInt32));
@@ -1095,12 +1288,44 @@ static OSStatus APUSB_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID 
     if (d != gDriverRef || id != kObjectID_Device) return kAudioHardwareBadObjectError;
     if (op == kAudioServerPlugInIOOperationWriteMix && stream == kObjectID_Stream_Output) {
         if (mode_has_output())
-            apusb_ring_write(&gOutRing, (int64_t)ci->mOutputTime.mSampleTime, (const float *)mainBuf, frames);
+        {
+            /* The stream's physical format is integer PCM (16-bit LE or 24-bit BE,
+             * exactly the wire format), and since we do not implement ConvertMix the
+             * HAL hands WriteMix the mix already converted to that physical format.
+             * Decode it back to float for the ring (the USB side re-encodes it). */
+            int64_t t = (int64_t)ci->mOutputTime.mSampleTime;
+            const uint8_t *src = (const uint8_t *)mainBuf;
+            size_t bpf = (size_t)kChannels * apusb_format_bytes(gMode->format);
+            if (!gLoggedWriteBytes && frames >= 2) {
+                gLoggedWriteBytes = true;
+                LOG("AudiophileUSB: WriteMix first bytes %02x %02x %02x %02x %02x %02x %02x %02x (%u bytes/frame physical)",
+                    src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7], (unsigned)bpf);
+            }
+            for (UInt32 done = 0; done < frames; ) {
+                UInt32 n = frames - done > 256 ? 256 : frames - done;
+                apusb_pcm_to_float(src + (size_t)done * bpf, gScratchMix, n, kChannels, gMode->format);
+                apusb_ring_write(&gOutRing, t + done, gScratchMix, n);
+                done += n;
+            }
+            atomic_store_explicit(&gOutWriteHi, t + (int64_t)frames, memory_order_release);
+            int64_t lead = t - host_now_sample();
+            if (lead < gWriteLeadMin) gWriteLeadMin = lead;
+            if (lead > gWriteLeadMax) gWriteLeadMax = lead;
+        }
     } else if (op == kAudioServerPlugInIOOperationReadInput && stream == kObjectID_Stream_Input) {
-        if (mode_has_input())
-            apusb_ring_read(&gInRing, (int64_t)ci->mInputTime.mSampleTime, (float *)mainBuf, frames, false);
-        else
-            memset(mainBuf, 0, (size_t)frames * kChannels * sizeof(float));
+        /* ReadInput must deliver the physical format too; the HAL converts to float. */
+        size_t bpf = (size_t)kChannels * apusb_format_bytes(gMode->format);
+        if (mode_has_input()) {
+            int64_t t = (int64_t)ci->mInputTime.mSampleTime;
+            uint8_t *dst = (uint8_t *)mainBuf;
+            for (UInt32 done = 0; done < frames; ) {
+                UInt32 n = frames - done > 256 ? 256 : frames - done;
+                apusb_ring_read(&gInRing, t + done, gScratchRd, n, false);
+                apusb_float_to_pcm(gScratchRd, dst + (size_t)done * bpf, n, kChannels, gMode->format);
+                done += n;
+            }
+        } else
+            memset(mainBuf, 0, (size_t)frames * bpf);
     }
     return kAudioHardwareNoError;
 }

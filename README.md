@@ -8,50 +8,50 @@ An **unofficial, open-source (MIT)** driver for the **M-Audio Audiophile USB**
 
 ## Status on real hardware (tested 2026-11-21, macOS 12.7.6, MacBook Pro 2015)
 
-**Why the card is "pure noise" with macOS's built-in driver.** Measured on a
-real unit, with nothing plugged into the inputs:
-- **24-bit samples are big-endian.** Recording the silent input as S24_3BE gives
-  −72 dBFS RMS. Reading the same data as little-endian, which is what AppleUSBAudio
-  uses, gives −5 dBFS of noise.
-- **16-bit samples are little-endian.** S16LE gives −72 dBFS; S16BE gives −24 dBFS.
-- **The card remembers the configuration it last streamed in.** After a different bit
-  depth or rate range has been used, even a correctly formatted stream reads as
-  −5 dBFS garbage. A USB re-enumeration restores it to −70…−97 dBFS. Apple's driver
-  runs its four engines in mixed depths and rates and never re-enumerates, which is
-  why 16-bit was noisy as well.
+> **Experimental and unsigned.** Not yet confirmed by ear. The measurements below
+> were made with an RCA loopback cable (analog out -> analog in) and the driver's
+> own diagnostics; please report what you actually hear.
 
-**What this package does now:**
+**Why the card was noise (all found by measurement):**
+1. **AppleUSBAudio reads 24-bit samples in the wrong byte order.** 24-bit is
+   big-endian on this card, 16-bit is little-endian (silent input: correct order
+   -72 dBFS, wrong order -5 / -24 dBFS).
+2. **Our 0.1.0 Core Audio driver read the HAL's buffers as Float32**, but the HAL
+   delivers them in the advertised *physical* integer format (16-bit LE / 24-bit
+   BE). Decoding the bytes our driver sent over USB gave a 1 kHz test tone an SNR of
+   **-7 dB** - the "badly tuned radio". Fixed: the same test now gives
+   **66-70 dB** at 24-bit and 59-60 dB at 16-bit (quantisation-limited).
+3. **The card latches the bit depth of the first stream after enumeration.**
+   Switching 16 <-> 24-bit afterwards gives garbage; rate changes within one depth are
+   fine. Only a real re-enumeration (hand the device back to macOS, then capture it
+   again) clears it. `audiophileusbd` now does that, only when the bit depth changes
+   (about 2-3 s), and after the Mac wakes from sleep.
+4. **Output scheduling:** the USB side now reads 2 ms behind "now", so it never
+   reads samples Core Audio has not written yet (0 underruns in all tests).
 
-| Part | What it does |
-|---|---|
-| `audiophileusbd` (root LaunchDaemon) | Takes the device away from AppleUSBAudio with `USBDeviceReEnumerate(kUSBReEnumerateCaptureDeviceMask)`. Apple documents this IOUSBLib call for root processes. No kext, no SIP or other security change. Each time the audio configuration changes, it re-enumerates the device so the firmware starts clean. When it stops (uninstall or `launchctl bootout`), it hands the device back to macOS. |
-| `AudiophileUSB.driver` (Core Audio) | A single **"Audiophile USB"** device from **M-Audio**, 2 in / 2 out. Physical formats: 16-bit 44.1/48 kHz, 24-bit 44.1/48 kHz, and 24-bit 88.2/96 kHz (half duplex, as on the hardware). Sends 24-bit big-endian and 16-bit little-endian. |
-| `AudiophileUSBMIDI.plugin` (CoreMIDI) | MIDI in/out on interface 6. |
+**Loopback results** (1 kHz tone on the left output only, -20/-30 dBFS; numbers from
+the driver log, measured on the raw USB data):
 
-**Measured over USB with the driver installed:**
-- Apple's four generic "Audiophile USB (tm)" devices are gone. `system_profiler` shows
-  one *Audiophile USB / M-Audio / 2 in / 2 out*.
-- A 1 kHz tone at −30 dBFS played through Core Audio for 3 s in each configuration
-  below. Every run had **0 USB errors, 0 resyncs and 0 overloads**:
-
-| Configuration | IO buffer | IOProc avg / max | Client CPU | Silent-input peak (driver log) |
+| Config | Wire SNR (sent) | Loopback tone | Right input (left-only tone) | Round trip |
 |---|---|---|---|---|
-| 24-bit 48 kHz | 64 | 2.4 / 14.4 µs | 1.0 % | −55 dBFS |
-| 24-bit 44.1 kHz | 32 | 1.4 / 13.9 µs | 1.6 % | −82 dBFS |
-| 16-bit 44.1 kHz | 64 | 2.3 / 14.0 µs | 0.9 % | −36 dBFS ⚠️ (higher; under investigation) |
+| 24-bit 48 kHz | 67 dB | 1000.00 Hz, SNR 30 dB* | -97.8 dBFS (clean) | 658 frames = 13.7 ms (buffer 128) |
+| 24-bit 44.1 kHz | 66 dB | 1000.00 Hz | -96.8 dBFS | 610 frames = 13.8 ms (buffer 128) |
+| 16-bit 48 kHz | 60 dB | 1000.05 Hz | -93.1 dBFS | 659 frames = 13.7 ms (buffer 128) |
+| 16-bit 44.1 kHz | 59 dB | clean when not right after a reset | | 609 frames = 13.8 ms (buffer 128) |
 
-- **Not yet confirmed by ear.** A clean-sounding tone and music still need to be heard
-  by a person. Please report what you hear.
-- **Latency reported to Core Audio** (design values) at 48 kHz:
-  - Output: 288 frames (6 ms) plus a 144-frame (3 ms) safety offset.
-  - Input: 96 frames (2 ms) plus 144 frames.
-  - Add your IO buffer, e.g. 64 frames.
+\* The loop loses about 26 dB (analog levels), so the received tone is about -59
+dBFS RMS and its SNR is limited by the input noise floor, not by the driver.
+
+- 0 USB errors, 0 resyncs, 0 overloads in normal runs; IO buffers 32-512 frames.
+- Tone on the right output appears only on the right input (channel order correct).
+- Right after a re-enumeration the analog inputs show a decaying DC offset for a few
+  seconds (analog settling).
+- Recording through Core Audio could not be checked remotely (macOS microphone
+  permission blocks it over SSH); the raw USB input data is verified.
 - **MIDI.** Sending a note on/off over USB worked. CoreMIDI-level testing needs a
   logged-in GUI session.
-- **Known issues:**
-  - Changing format or rate costs about 1.3 s, because the device is re-enumerated.
-  - Once, a test process took about 5 minutes to exit after stopping an isochronous
-    stream. This is being investigated.
+- **Known issues:** a bit-depth change costs 2-3 s and briefly lets macOS's own driver
+  see the card. If the Mac sleeps during playback, stop and start playback again.
 
 M-Audio's last Mac driver (1.8.1) supports only OS X 10.6/10.7. This project replaces
 it with user-space components:

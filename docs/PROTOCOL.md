@@ -116,12 +116,44 @@ dBFS; the wrong one gives about −5 to −25 dBFS.
 | 3 | 24 | S24_3BE | −71.8 dBFS ✅ |
 | 3 | 24 | S24_3LE | −4.8 dBFS (this is what AppleUSBAudio does) |
 
-**State:** after the device has streamed in another configuration, all four tests
-above read about −4.7 dBFS. A USB re-enumeration restores the clean values. The
-driver therefore asks `audiophileusbd` to re-enumerate the device before starting
-in a configuration that differs from the last one. The request goes over Darwin
-notifications (`com.harmoniqpunk.audiophileusb.reset-request` / `reset-done`), which
-the AudioServerPlugIn sandbox allows.
+**State (corrected after loopback tests):** the device keeps the *sample format*
+(16- or 24-bit) of the first stream it carries after macOS enumerates it. Streaming
+in the other bit depth afterwards gives garbage. Rate changes within the same bit
+depth (44.1 <-> 48 kHz) are fine. Measured with an RCA loopback and a silent input:
+
+| Sequence (direct USB, `apusb-diag record`) | RMS after 100 ms |
+|---|---|
+| fresh -> 16-bit | -73.6 dBFS |
+| then 24-bit | -65.4 dBFS (bad: the top byte repeats the low byte, `45 fd 45`) |
+| then 16-bit again | -93.1 dBFS |
+
+Reset methods tried from the root daemon (`apusb-diag reset --method N`):
+
+| Method | Clears the latched format? |
+|---|---|
+| 1 `USBDeviceReEnumerate(capture)` on the captured device | no |
+| 2 `SET_CONFIGURATION` 0 -> 1 | no |
+| 3 `ResetDevice` (port reset) + `SET_CONFIGURATION` 1 | no |
+| 4 release to macOS (`ReEnumerate(release)`), wait for AppleUSBAudio to attach, capture the new device | **yes** |
+
+So the daemon only re-enumerates (method 4, about 2-3 s) when a stream needs a bit
+depth different from the one the device has latched since its last enumeration;
+otherwise it answers immediately. The request goes over Darwin notifications
+(`com.harmoniqpunk.audiophileusb.reset-request` / `reset-done`; the request's notify
+state carries the method and the stream key), which the AudioServerPlugIn sandbox
+allows. After each real re-enumeration the analog inputs show a slowly decaying DC
+offset (about -55 dBFS falling under -66 dBFS within ~3 s) - analog settling, not a
+data error.
+
+**Core Audio buffers are in the physical format.** The driver advertises integer
+physical formats (16-bit LE / 24-bit BE). Because it does not implement ConvertMix /
+ConvertInput, the HAL hands `WriteMix` the mix already converted to that physical
+format and expects `ReadInput` to deliver it too. Version 0.1.0 treated these buffers
+as Float32 - that was the remaining "badly tuned radio" noise. Logged evidence: the
+first `WriteMix` bytes of a 1 kHz tone at -30 dBFS, 48 kHz, 24-bit are
+`00 00 00 00 00 00 | 00 87 ..`: frame 0 is silence and frame 1 starts with the
+big-endian 24-bit value 0x0087xx (0.0316 * sin(2*pi/48) * 2^23 = 0x008750). The
+16-bit stream showed `00 00 00 00 87 00 87 00` (little-endian 0x0087 on both channels).
 
 **Capture:** `USBDeviceReEnumerate(kUSBReEnumerateCaptureDeviceMask)`, run as root,
 terminates AppleUSBAudio on interfaces 1–5 and also releases MIDIServer's client.
