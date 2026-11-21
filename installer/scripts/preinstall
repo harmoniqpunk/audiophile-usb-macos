@@ -1,0 +1,6 @@
+#!/bin/bash
+# Remove a previous copy so stale files never mix with the new version.
+set -u
+rm -rf "/Library/Audio/Plug-Ins/HAL/AudiophileUSB.driver"
+rm -rf "/Library/Audio/MIDI Drivers/AudiophileUSBMIDI.plugin"
+exit 0

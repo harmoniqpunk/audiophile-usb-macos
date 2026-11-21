@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>AudiophileUSBMIDI</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.harmoniqpunk.audiophileusb.midi</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>AudiophileUSBMIDI</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright (c) 2026 Harmoniq Punk. MIT License. Experimental, unofficial.</string>
+	<key>CFPlugInDynamicRegistration</key>
+	<string>NO</string>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>7E1B5A0C-3D2F-4C8E-9A61-2B7F4D9E0C13</key>
+		<string>AudiophileUSBMIDI_Create</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<key>ECDE9574-0FE4-11D4-BB1A-0050E4CEA526</key>
+		<array>
+			<string>7E1B5A0C-3D2F-4C8E-9A61-2B7F4D9E0C13</string>
+		</array>
+	</dict>
+</dict>
+</plist>

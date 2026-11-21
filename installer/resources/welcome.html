@@ -1,0 +1,16 @@
+<html><body style="font-family: -apple-system, Helvetica; font-size: 13px">
+<h2>Audiophile USB community driver (EXPERIMENTAL)</h2>
+<p>An unofficial, open-source (MIT) driver for the <b>M-Audio Audiophile USB</b> (USB ID 0763:2003)
+on macOS 12 Monterey and later. It is <b>not</b> made or supported by M-Audio / inMusic.</p>
+<p><b>Status: experimental, unsigned, not yet tested on real hardware.</b> It may produce no sound,
+noise, or glitches. It does not install a kernel extension and does not change any security setting.</p>
+<p>This installs:</p>
+<ul>
+<li>/Library/Audio/Plug-Ins/HAL/AudiophileUSB.driver (Core Audio driver)</li>
+<li>/Library/Audio/MIDI Drivers/AudiophileUSBMIDI.plugin (MIDI driver)</li>
+<li>/usr/local/bin/apusb-diag (diagnostics tool)</li>
+<li>/Library/Application Support/AudiophileUSB (diagnostics + uninstaller)</li>
+</ul>
+<p>At the end Core Audio is restarted (sound stops for a second) and a read-only diagnostics report
+is saved to your Desktop.</p>
+</body></html>

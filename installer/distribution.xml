@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Audiophile USB community driver @VERSION@ (EXPERIMENTAL)</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="LICENSE.txt"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <options customize="never" require-scripts="true" hostArchitectures="x86_64,arm64"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="12.0"/>
+        </allowed-os-versions>
+    </volume-check>
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.harmoniqpunk.audiophileusb"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.harmoniqpunk.audiophileusb" visible="false">
+        <pkg-ref id="com.harmoniqpunk.audiophileusb"/>
+    </choice>
+    <pkg-ref id="com.harmoniqpunk.audiophileusb" version="@VERSION@" onConclusion="none">AudiophileUSB-component.pkg</pkg-ref>
+</installer-gui-script>

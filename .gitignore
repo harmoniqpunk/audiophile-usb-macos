@@ -1,0 +1,6 @@
+build/
+dist/
+*.o
+*.dSYM/
+.DS_Store
+apusb-record.wav

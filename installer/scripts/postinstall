@@ -1,0 +1,31 @@
+#!/bin/bash
+# Fix ownership, reload Core Audio / CoreMIDI, then run the read-only diagnostics
+# for the logged-in user (report saved to their Desktop).
+set -u
+HAL="/Library/Audio/Plug-Ins/HAL/AudiophileUSB.driver"
+MIDI="/Library/Audio/MIDI Drivers/AudiophileUSBMIDI.plugin"
+SUPPORT="/Library/Application Support/AudiophileUSB"
+
+for p in "$HAL" "$MIDI" "$SUPPORT"; do
+    [[ -e "$p" ]] || continue
+    chown -R root:wheel "$p"
+    chmod -R go-w "$p"
+    xattr -dr com.apple.quarantine "$p" 2>/dev/null || true
+done
+[[ -f /usr/local/bin/apusb-diag ]] && chown root:wheel /usr/local/bin/apusb-diag && chmod 0755 /usr/local/bin/apusb-diag
+
+# Reload Core Audio so the new HAL plug-in is picked up (audio stops briefly).
+launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null || killall coreaudiod 2>/dev/null || true
+# CoreMIDI's server restarts on demand and rescans MIDI drivers.
+killall MIDIServer 2>/dev/null || true
+
+# Run diagnostics as the console user so the report lands on their Desktop.
+CONSOLE_USER="$(stat -f %Su /dev/console 2>/dev/null || true)"
+if [[ -n "$CONSOLE_USER" && "$CONSOLE_USER" != "root" && -x "$SUPPORT/collect-diagnostics.command" ]]; then
+    sleep 3
+    CONSOLE_UID="$(id -u "$CONSOLE_USER")"
+    launchctl asuser "$CONSOLE_UID" sudo -H -u "$CONSOLE_USER" \
+        "$SUPPORT/collect-diagnostics.command" --no-open >/dev/null 2>&1 || \
+        "$SUPPORT/collect-diagnostics.command" --no-open --output "/Users/Shared/AudiophileUSB" >/dev/null 2>&1 || true
+fi
+exit 0
